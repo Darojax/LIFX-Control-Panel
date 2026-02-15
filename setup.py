@@ -9,7 +9,7 @@ setup(
     name="lifx_control_panel",
     version=str(VERSION),
     description="An open source application for controlling your LIFX brand lights",
-    url="http://github.com/samclane/LIFX-Control-Panel",
+    url="https://github.com/Darojax/LIFX-Control-Panel",
     author="Sawyer McLane",
     author_email="samclane@gmail.com",
     license="MIT",
@@ -31,7 +31,7 @@ setup(
         "pystray",
     ],
     download_url=(
-        ("https://github.com/samclane/LIFX-Control-Panel/archive/" + str(VERSION))
+        ("https://github.com/Darojax/LIFX-Control-Panel/archive/" + str(VERSION))
         + ".tar.gz"
     ),
     long_description_content_type="text/markdown",

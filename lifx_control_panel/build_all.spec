@@ -11,7 +11,7 @@ with open('_constants.py', 'w') as f:
     f.write("VERSION = \"{}\"\n".format(vers))
     f.write("BUILD_DATE = \"{}\"\n".format(bd))
     f.write("AUTHOR = \"{}\"\n".format(auth))
-    f.write("DEBUGGING = {}".format(str(is_debug)))
+    f.write("DEBUGGING = {}\n".format(str(is_debug)))
 
 block_cipher = None
 
@@ -34,12 +34,12 @@ for d in a.datas:
         a.datas.remove(d)
         break
 
-a.datas += [('res//splash_vector.png', '../res/splash_vector.png', 'Data')]
-a.datas += [('res//icon_vector.ico', '../res/icon_vector.ico', 'Data')]
-a.datas += [('res//lightbulb.png', '../res/lightbulb.png', 'Data')]
-a.datas += [('res//group.png', '../res/group.png', 'Data')]
-a.datas += [('res//multizone.png', '../res/multizone.png', 'Data')]
-a.datas += [('default.ini', '../default.ini', '.')]
+a.datas += [('res//splash_vector.png', '../res/splash_vector.png', 'DATA')]
+a.datas += [('res//icon_vector.ico', '../res/icon_vector.ico', 'DATA')]
+a.datas += [('res//lightbulb.png', '../res/lightbulb.png', 'DATA')]
+a.datas += [('res//group.png', '../res/group.png', 'DATA')]
+a.datas += [('res//multizone.png', '../res/multizone.png', 'DATA')]
+a.datas += [('default.ini', '../default.ini', 'DATA')]
 
 pyz = PYZ(a.pure, a.zipped_data,
           cipher=block_cipher)
@@ -72,7 +72,7 @@ with open('_constants.py', 'w') as f:
     f.write("VERSION = \"{}\"\n".format(vers))
     f.write("BUILD_DATE = \"{}\"\n".format(bd))
     f.write("AUTHOR = \"{}\"\n".format(auth))
-    f.write("DEBUGGING = {}".format(str(is_debug)))
+    f.write("DEBUGGING = {}\n".format(str(is_debug)))
 
 exe = EXE(pyz,
           a.scripts,
@@ -111,12 +111,12 @@ for d in a.datas:
         a.datas.remove(d)
         break
 
-a.datas += [('res//splash_vector.png', '../res/splash_vector.png', 'Data')]
-a.datas += [('res//icon_vector.ico', '../res/icon_vector.ico', 'Data')]
-a.datas += [('res//lightbulb.png', '../res/lightbulb.png', 'Data')]
-a.datas += [('res//group.png', '../res/group.png', 'Data')]
-a.datas += [('res//multizone.png', '../res/multizone.png', 'Data')]
-a.datas += [('default.ini', '../default.ini', '.')]
+a.datas += [('res//splash_vector.png', '../res/splash_vector.png', 'DATA')]
+a.datas += [('res//icon_vector.ico', '../res/icon_vector.ico', 'DATA')]
+a.datas += [('res//lightbulb.png', '../res/lightbulb.png', 'DATA')]
+a.datas += [('res//group.png', '../res/group.png', 'DATA')]
+a.datas += [('res//multizone.png', '../res/multizone.png', 'DATA')]
+a.datas += [('default.ini', '../default.ini', 'DATA')]
 
 pyz = PYZ(a.pure, a.zipped_data,
           cipher=block_cipher)
@@ -138,4 +138,4 @@ with open('_constants.py', 'w') as f:
     f.write("VERSION = \"{}\"\n".format(vers))
     f.write("BUILD_DATE = \"{}\"\n".format(bd))
     f.write("AUTHOR = \"{}\"\n".format(auth))
-    f.write("DEBUGGING = {}".format(str(False)))
+    f.write("DEBUGGING = {}\n".format(str(False)))
