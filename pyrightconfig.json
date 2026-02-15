@@ -1,0 +1,8 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": [
+    "lifx_control_panel"
+  ],
+  "pythonVersion": "3.12"
+}

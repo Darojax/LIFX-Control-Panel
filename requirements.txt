@@ -2,6 +2,7 @@ keyboard
 mouse
 Pillow
 git+https://github.com/samclane/lifxlan@master#egg=lifxlan
+bitstring<4
 numexpr
 numpy
 mss

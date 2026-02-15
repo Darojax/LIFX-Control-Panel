@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """General utility classes and functions."""
+
 import os
 import sys
 from functools import lru_cache
@@ -10,7 +11,7 @@ import mss
 
 
 class Color:
-    """ Container class for a single color vector in HSBK color-space. """
+    """Container class for a single color vector in HSBK color-space."""
 
     __slots__ = ["hue", "saturation", "brightness", "kelvin"]
 
@@ -64,8 +65,8 @@ TypeHSBK = Union[Tuple[int, int, int, int], Color]
 
 
 def hsbk_to_rgb(hsvk: TypeHSBK) -> TypeRGB:
-    """ Convert Tuple in HSBK color-space to RGB space.
-    Converted from PHP https://gist.github.com/joshrp/5200913 """
+    """Convert Tuple in HSBK color-space to RGB space.
+    Converted from PHP https://gist.github.com/joshrp/5200913"""
     # pylint: disable=invalid-name
     iH, iS, iV, iK = hsvk
     dS = (100 * iS / 65535) / 100.0  # Saturation: 0.0-1.0
@@ -127,7 +128,7 @@ def hsbk_to_rgb(hsvk: TypeHSBK) -> TypeRGB:
 
 
 def hsv_to_rgb(h: float, s: float = 1, v: float = 1) -> TypeRGB:
-    """ Convert a Hue-angle to an RGB value for display. """
+    """Convert a Hue-angle to an RGB value for display."""
     # pylint: disable=invalid-name
     h = float(h)
     s = float(s)
@@ -157,7 +158,7 @@ def hsv_to_rgb(h: float, s: float = 1, v: float = 1) -> TypeRGB:
 
 
 def kelvin_to_rgb(temperature: int) -> TypeRGB:
-    """ Convert a Kelvin (K) color-temperature to an RGB value for display."""
+    """Convert a Kelvin (K) color-temperature to an RGB value for display."""
     # pylint: disable=invalid-name
     temperature /= 100
     if temperature <= 66:
@@ -166,11 +167,11 @@ def kelvin_to_rgb(temperature: int) -> TypeRGB:
         green = 99.4708025861 * log(green + 0.0000000001) - 161.1195681661
     else:
         red = temperature - 60
-        red = 329.698727466 * (red ** -0.1332047592)
+        red = 329.698727466 * (red**-0.1332047592)
         red = max(red, 0)
         red = min(red, 255)
         green = temperature - 60
-        green = 288.1221695283 * (green ** -0.0755148492)
+        green = 288.1221695283 * (green**-0.0755148492)
     green = max(green, 0)
     green = min(green, 255)
     # calc blue
@@ -187,41 +188,54 @@ def kelvin_to_rgb(temperature: int) -> TypeRGB:
 
 
 def tuple2hex(tuple_: TypeRGB) -> str:
-    """ Takes a color in tuple form and converts it to hex. """
+    """Takes a color in tuple form and converts it to hex."""
     return "#%02x%02x%02x" % tuple_
 
 
 def str2list(string: str, type_func) -> List:
-    """ Takes a Python list-formatted string and returns a list of elements of type type_func """
+    """Takes a Python list-formatted string and returns a list of elements of type type_func"""
     return list(map(type_func, string.strip("()[]").split(",")))
 
 
 def str2tuple(string: str, type_func) -> Tuple:
-    """ Takes a Python list-formatted string and returns a tuple of type type_func """
+    """Takes a Python list-formatted string and returns a tuple of type type_func"""
     return tuple(map(type_func, string.strip("()[]").split(",")))
 
 
 # Multi monitor methods
 @lru_cache(maxsize=None)
 def get_primary_monitor() -> Tuple[int, ...]:
-    """ Return the system's default primary monitor rectangle bounds. """
+    """Return the system's default primary monitor rectangle bounds."""
     return [rect for rect in get_display_rects() if rect[:2] == (0, 0)][
         0
     ]  # primary monitor has top left as 0, 0
 
 
-def resource_path(relative_path) -> Union[int, bytes]:
-    """ Get absolute path to resource, works for dev and for PyInstaller """
+def resource_path(relative_path: str) -> str:
+    """Get an absolute resource path in both source and frozen builds."""
     try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        # PyInstaller creates a temp folder and stores path in _MEIPASS.
         base_path = sys._MEIPASS  # pylint: disable=protected-access,no-member
+        candidate = os.path.join(base_path, relative_path)
+        if os.path.exists(candidate):
+            return candidate
     except Exception:  # pylint: disable=broad-except
-        base_path = os.path.abspath("../")
+        pass
 
-    return os.path.join(base_path, relative_path)
+    util_dir = os.path.dirname(__file__)
+    package_root = os.path.abspath(os.path.join(util_dir, ".."))
+    project_root = os.path.abspath(os.path.join(util_dir, "..", ".."))
+
+    for base_path in (project_root, package_root, os.getcwd()):
+        candidate = os.path.join(base_path, relative_path)
+        if os.path.exists(candidate):
+            return candidate
+
+    # Return the most likely source-tree path when the file is missing.
+    return os.path.join(project_root, relative_path)
 
 
 def get_display_rects():
-    """ Return a list of tuples of monitor rectangles. """
+    """Return a list of tuples of monitor rectangles."""
     with mss.mss() as sct:
         return [tuple(m.values()) for m in sct.monitors]

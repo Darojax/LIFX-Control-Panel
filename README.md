@@ -44,6 +44,9 @@ You can now install through PyPI, by running `pip install lifx-control-panel`. T
 
 To manually install the dependencies, run `pip install -r requirements.txt`. 
 
+> Note: `lifxlan` currently requires `bitstring<4` for packet serialization compatibility.
+> This repository pins that automatically in both `requirements.txt` and `setup.py`.
+
 Due to some initial PyCharm cruft, the environment paths are a bit messed up. 
 - The main script path is:
   - `..\LIFX-Control-Panel\lifx_control_panel\__main__.pyw`

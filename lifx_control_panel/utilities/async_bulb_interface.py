@@ -3,13 +3,13 @@ import concurrent.futures
 import logging
 import queue
 import threading
-from typing import List, Union
+from typing import List, Sequence, Union, cast
 
 import lifxlan
 
 
 class AsyncBulbInterface(threading.Thread):
-    """ Asynchronous networking layer between LIFX devices and the GUI. """
+    """Asynchronous networking layer between LIFX devices and the GUI."""
 
     def __init__(self, event, heartbeat_ms):
         threading.Thread.__init__(self)
@@ -18,7 +18,7 @@ class AsyncBulbInterface(threading.Thread):
 
         self.hb_rate = heartbeat_ms
 
-        self.device_list = []
+        self.device_list: List[lifxlan.Device] = []
         self.color_queue = {}
         self.color_cache = {}
         self.power_queue = {}
@@ -27,9 +27,12 @@ class AsyncBulbInterface(threading.Thread):
         self.logger = logging.getLogger("root")
 
     def set_device_list(
-        self, device_list: List[lifxlan.Device],
+        self,
+        device_list: Sequence[
+            Union[lifxlan.Device, lifxlan.Light, lifxlan.MultiZoneLight]
+        ],
     ):
-        """ Set internet device list to passed list of LIFX devices. """
+        """Set internet device list to passed list of LIFX devices."""
         for dev in device_list:
             try:
                 label = dev.get_label()
@@ -50,14 +53,14 @@ class AsyncBulbInterface(threading.Thread):
                 except Exception as e:
                     self.logger.error(e)
                     self.power_cache[dev.label] = 0
-                self.device_list.append(dev)
+                self.device_list.append(cast(lifxlan.Device, dev))
             except lifxlan.WorkflowException as exc:
                 self.logger.warning(
                     "Error when communicating with LIFX device: %s", exc
                 )
 
     def query_device(self, target):
-        """ Check if target has new state. If it does, push it to the queue and cache the value. """
+        """Check if target has new state. If it does, push it to the queue and cache the value."""
         try:
             pwr = target.get_power()
             if pwr != self.power_cache[target.label]:
@@ -71,7 +74,7 @@ class AsyncBulbInterface(threading.Thread):
             pass
 
     def run(self):
-        """ Continuous loop that has a thread query each device every HEARTBEAT ms. """
+        """Continuous loop that has a thread query each device every HEARTBEAT ms."""
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, len(self.device_list))
         ) as executor:

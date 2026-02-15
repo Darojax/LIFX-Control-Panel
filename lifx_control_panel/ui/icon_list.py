@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import tkinter
+from tkinter import ttk
 from typing import Dict, Union
 from PIL import Image as pImage
 
@@ -11,7 +12,7 @@ from ..utilities import utils
 
 @dataclass
 class BulbIconListSettings:
-    """ Encapsulates all constants for the bulb icon list """
+    """Encapsulates all constants for the bulb icon list"""
 
     window_width: int
     icon_width: int
@@ -29,7 +30,7 @@ class BulbIconListSettings:
 
 
 class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attributes
-    """ Holds the dynamic icons for each Device and Group """
+    """Holds the dynamic icons for each Device and Group"""
 
     def __init__(self, *args, is_group: bool = False, **kwargs):
         # Parameters
@@ -50,7 +51,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
             *args,
             width=self.settings.window_width,
             height=self.settings.icon_height,
-            **kwargs
+            **kwargs,
         )
         self.scroll_x = 0
         self.scroll_y = 0
@@ -61,7 +62,9 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
             height=self.settings.icon_height,
             scrollregion=(0, 0, self.scroll_x, self.scroll_y),
         )
-        h_scroll = tkinter.Scrollbar(self, orient=tkinter.HORIZONTAL)
+        h_scroll = ttk.Scrollbar(
+            self, orient=tkinter.HORIZONTAL, style="Horizontal.TScrollbar"
+        )
         h_scroll.pack(side=tkinter.BOTTOM, fill=tkinter.X)
         h_scroll.config(command=self.canvas.xview)
         self.canvas.config(
@@ -76,11 +79,11 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
 
     @property
     def current_icon(self):
-        """ Returns the name of the currently selected Device/Group """
+        """Returns the name of the currently selected Device/Group"""
         return self._current_icon
 
     def icon_path(self):
-        """ Returns the correct icon path for single Device or Group """
+        """Returns the correct icon path for single Device or Group"""
         return (
             utils.resource_path("res/group.png")
             if self.is_group
@@ -89,7 +92,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
 
     @property
     def icon_paths(self) -> Dict[type, Union[int, bytes]]:
-        """ Returns a dictionary of the icon paths for each device type """
+        """Returns a dictionary of the icon paths for each device type"""
         return {
             lifxlan.Group: utils.resource_path("res/group.png"),
             lifxlan.Light: utils.resource_path("res/lightbulb.png"),
@@ -97,7 +100,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
         }
 
     def draw_bulb_icon(self, bulb, label):
-        """ Given a bulb and a name, add the icon to the end of the row. """
+        """Given a bulb and a name, add the icon to the end of the row."""
         # Make room on canvas
         self.scroll_x += self.settings.icon_width
         self.canvas.configure(scrollregion=(0, 0, self.scroll_x, self.scroll_y))
@@ -119,6 +122,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
             self.current_icon_width + self.settings.icon_padding / 2,
             self.settings.icon_height / 2 + 2 * self.settings.icon_padding,
             text=label[:8],
+            fill=self._get_contrasting_text_color(),
             anchor=tkinter.NW,
             tags=[label],
         )
@@ -127,8 +131,15 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
         # update sizing info
         self.current_icon_width += self.settings.icon_width
 
+    def _get_contrasting_text_color(self):
+        """Return readable text color based on current canvas background."""
+        bg = self.canvas.cget("bg")
+        red, green, blue = [value // 256 for value in self.winfo_rgb(bg)]
+        luminance = 0.299 * red + 0.587 * green + 0.114 * blue
+        return "#111111" if luminance > 145 else "#f1f5f9"
+
     def update_icon(self, bulb: lifxlan.Device):
-        """ If changes have been detected in the interface, update the bulb state. """
+        """If changes have been detected in the interface, update the bulb state."""
         if self.is_group:
             return
         try:
@@ -186,7 +197,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
         self.canvas.itemconfig(image, image=sprite)
 
     def set_selected_bulb(self, light_name):
-        """ Highlight the newly selected bulb icon when changed. """
+        """Highlight the newly selected bulb icon when changed."""
         if self._current_icon:
             self.clear_selected()
         sprite, image, _ = self.bulb_dict[light_name]
@@ -209,7 +220,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
         self._current_icon = light_name
 
     def clear_selected(self):
-        """ Reset background to original state (from highlighted). """
+        """Reset background to original state (from highlighted)."""
         sprite, image, _ = self.bulb_dict[self._current_icon]
         color_string = ""
         for y in range(sprite.height()):  # pylint: disable=invalid-name

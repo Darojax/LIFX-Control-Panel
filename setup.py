@@ -24,6 +24,7 @@ setup(
         "pyaudio",
         "Pillow",
         "lifxlan",
+        "bitstring<4",
         "numexpr",
         "numpy",
         "mss",
