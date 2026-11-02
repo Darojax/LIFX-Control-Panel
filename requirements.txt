@@ -3,9 +3,8 @@ mouse
 Pillow
 git+https://github.com/samclane/lifxlan@master#egg=lifxlan
 bitstring<4
-numexpr
 numpy
-mss
+# Keep the tested Windows cursor-flicker workaround compatible.
+mss==10.1.0
 pystray
 pywin32
-# pyaudio

@@ -5,59 +5,81 @@ Contains several basic "Color-Following" functions, as well as custom Stop/Start
 """
 
 import logging
+import sys
 import threading
-from functools import lru_cache
+from contextlib import ExitStack
 from typing import List, Tuple
 import time
-import math
 
 import mss
-import numexpr as ne
 import numpy as np
+
+if sys.platform == "win32":
+    import mss.windows
+
+    # CAPTUREBLT can make the cursor flicker during repeated Windows captures.
+    # Use the MSS maintainer's workaround for all screen-colour capture paths.
+    # Layered/translucent overlays may be omitted from the resulting image.
+    # https://github.com/BoboTiG/python-mss/issues/179
+    mss.windows.CAPTUREBLT = 0
 
 # from lib.color_functions import dominant_color
 from PIL import Image
 from lifxlan import utils
 
-from .utils import str2list, Color
-from ..ui.settings import config
+from .utils import str2list, Color, get_primary_monitor
+from .action_sync import ActionProcessor, ActionSettings
+from ..ui.settings import config, get_action_sync_value
 
 from lifx_control_panel.utilities.utils import hsv_to_rgb
 
 
-@lru_cache(maxsize=32)
+def validate_monitor_bounds(monitor):
+    """Resolve a saved region and reject invalid dimensions before capture."""
+    if isinstance(monitor, str):
+        if "full" in monitor.lower():
+            if all(
+                value.strip().lower() == "full"
+                for value in monitor.strip("()[]").split(",")
+            ):
+                return "full"
+            raise ValueError("Use full for every coordinate, or enter four integers.")
+        if monitor.startswith("get_primary_monitor"):
+            monitor = get_primary_monitor()
+        else:
+            try:
+                monitor = str2list(monitor, int)
+            except ValueError as exc:
+                raise ValueError("Screen coordinates must be integers.") from exc
+    if len(monitor) != 4 or monitor[2] <= 0 or monitor[3] <= 0:
+        raise ValueError(
+            "Enter left, top, width and height; width and height must be positive."
+        )
+    return tuple(monitor)
+
+
 def get_monitor_bounds(func):
-    """Returns the rectangular coordinates of the desired Avg. Screen area. Can pass a function to find the result
-    procedurally"""
-    return func() or config["AverageColor"]["DefaultMonitor"]
+    """Read current bounds; caching this used to ignore region edits."""
+    return validate_monitor_bounds(func() or config["AverageColor"]["DefaultMonitor"])
 
 
-def get_screen_as_image():
-    """Grabs the entire primary screen as an image"""
-    with mss.mss() as sct:
-        monitor = sct.monitors[0]
-
-        # Capture a bbox using percent values
-        left = monitor["left"]  # + monitor["width"] * 5 // 100  # 5% from the left
-        top = monitor["top"]  # + monitor["height"] * 5 // 100  # 5% from the top
-        right = monitor["left"] + monitor["width"]  # left + 400  # 400px width
-        lower = monitor["top"] + monitor["height"]  # top + 400  # 400px height
-        bbox = (left, top, right, lower)
-        sct_img = sct.grab(bbox)
-        return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+def get_screen_as_image(capture=None):
+    """Grab all displays, reusing the worker's capture resources when supplied."""
+    if capture is None:
+        with mss.mss() as capture:
+            return get_screen_as_image(capture)
+    screenshot = capture.grab(capture.monitors[0])
+    return Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
 
-def get_rect_as_image(bounds: Tuple[int, int, int, int]):
-    """Grabs a rectangular area of the primary screen as an image"""
-    with mss.mss() as sct:
-        monitor = {
-            "left": bounds[0],
-            "top": bounds[1],
-            "width": bounds[2],
-            "height": bounds[3],
-        }
-        sct_img = sct.grab(monitor)
-        return Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+def get_rect_as_image(bounds: Tuple[int, int, int, int], capture=None):
+    """Grab a region, reusing the worker's capture resources when supplied."""
+    if capture is None:
+        with mss.mss() as capture:
+            return get_rect_as_image(bounds, capture)
+    monitor = dict(zip(("left", "top", "width", "height"), bounds))
+    screenshot = capture.grab(monitor)
+    return Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
 
 
 def normalize_rectangles(rects: List[Tuple[int, int, int, int]]):
@@ -99,46 +121,100 @@ class ColorCycle:
         return "ColorCycle"
 
 
-def avg_screen_color(initial_color, func_bounds=lambda: None):
+def screen_rgb_to_hsbk(rgb, temperature):
+    """Keep tiny near-black RGB differences from becoming saturated colour noise."""
+    color = list(utils.RGBtoHSBK(rgb, temperature=temperature))
+    threshold = max(
+        0, min(255, config.getint("AverageColor", "nearblackthreshold", fallback=10))
+    )
+    if max(rgb) < threshold:
+        color[1] = 0
+    return color
+
+
+def limit_screen_brightness(brightness):
+    """Apply offset first, then the screen-only cap and dark-scene cutoff."""
+    maximum = max(
+        0, min(65535, config.getint("AverageColor", "maxbrightness", fallback=65535))
+    )
+    cutoff = max(
+        0,
+        min(maximum, config.getint("AverageColor", "minbrightnesscutoff", fallback=0)),
+    )
+    brightness = max(0, min(maximum, brightness))
+    return 0 if brightness < cutoff else brightness
+
+
+def avg_screen_color(initial_color, func_bounds=lambda: None, capture=None):
     """Capture an image of the monitor defined by func_bounds, then get the average color of the image in HSBK"""
     monitor = get_monitor_bounds(func_bounds)
-    if "full" in monitor:
-        screenshot = get_screen_as_image()
+    if monitor == "full":
+        screenshot = get_screen_as_image(capture)
     else:
-        screenshot = get_rect_as_image(str2list(monitor, int))
+        screenshot = get_rect_as_image(monitor, capture)
     # Resizing the image to 1x1 pixel will give us the average for the whole image (via HAMMING interpolation)
-    color = screenshot.resize((1, 1), Image.HAMMING).getpixel((0, 0))
-    return list(utils.RGBtoHSBK(color, temperature=initial_color[3]))
+    color = screenshot.resize((1, 1), Image.Resampling.HAMMING).getpixel((0, 0))
+    return screen_rgb_to_hsbk(color, initial_color[3])
 
 
-def dominant_screen_color(initial_color, func_bounds=lambda: None):
+def dominant_screen_color(initial_color, func_bounds=lambda: None, capture=None):
     """
     Gets the dominant color of the screen defined by func_bounds
     https://stackoverflow.com/questions/50899692/most-dominant-color-in-rgb-image-opencv-numpy-python
     """
     monitor = get_monitor_bounds(func_bounds)
-    if "full" in monitor:
-        screenshot = get_screen_as_image()
+    if monitor == "full":
+        screenshot = get_screen_as_image(capture)
     else:
-        screenshot = get_rect_as_image(str2list(monitor, int))
+        screenshot = get_rect_as_image(monitor, capture)
 
-    downscale_width, downscale_height = screenshot.width // 4, screenshot.height // 4
-    screenshot = screenshot.resize((downscale_width, downscale_height), Image.HAMMING)
+    downscale_width, downscale_height = max(1, screenshot.width // 4), max(
+        1, screenshot.height // 4
+    )
+    screenshot = screenshot.resize(
+        (downscale_width, downscale_height), Image.Resampling.HAMMING
+    )
 
     a = np.array(screenshot)
-    a2D = a.reshape(-1, a.shape[-1])
-    col_range = (256, 256, 256)  # generically : a2D.max(0)+1
-    eval_params = {
-        "a0": a2D[:, 0],
-        "a1": a2D[:, 1],
-        "a2": a2D[:, 2],
-        "s0": col_range[0],
-        "s1": col_range[1],
-    }
-    a1D = ne.evaluate("a0*s0*s1+a1*s0+a2", eval_params)
-    color = np.unravel_index(np.bincount(a1D).argmax(), col_range)
+    a2D = a.reshape(-1, a.shape[-1]).astype(np.int32)
+    # Count only colours present, rather than allocating up to 16 million bins
+    # (about 128 MiB) on every capture, even for a single white pixel.
+    colors, counts = np.unique(a2D, axis=0, return_counts=True)
+    color = tuple(int(channel) for channel in colors[counts.argmax()])
 
-    return list(utils.RGBtoHSBK(color, temperature=initial_color[3]))
+    return screen_rgb_to_hsbk(color, initial_color[3])
+
+
+class ActionScreenColor:
+    __name__ = "CinemaSync"
+
+    def __call__(
+        self, initial_color, func_bounds=lambda: None, capture=None, processor=None
+    ):
+        monitor = get_monitor_bounds(func_bounds)
+        image = (
+            get_screen_as_image(capture)
+            if monitor == "full"
+            else get_rect_as_image(monitor, capture)
+        )
+        settings = ActionSettings(
+            get_action_sync_value("impact", 80) / 100,
+            get_action_sync_value("response", 90) / 100,
+            get_action_sync_value("decay_ms", 180),
+        )
+        signal = (processor or ActionProcessor()).analyze(image, settings)
+        return [
+            round(signal.hue * 65535),
+            round(signal.saturation * 65535),
+            round(signal.brightness * 65535),
+            initial_color[3],
+        ]
+
+
+def is_screen_effect(function):
+    return function in (avg_screen_color, dominant_screen_color) or isinstance(
+        function, ActionScreenColor
+    )
 
 
 class ColorThread(threading.Thread):
@@ -146,15 +222,15 @@ class ColorThread(threading.Thread):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, daemon=True, **kwargs)
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def stop(self):
         """Stop thread by setting event"""
-        self._stop.set()
+        self._stop_event.set()
 
     def stopped(self):
         """Check if thread has been stopped"""
-        return self._stop.isSet()
+        return self._stop_event.is_set()
 
 
 class ColorThreadRunner:
@@ -170,54 +246,139 @@ class ColorThreadRunner:
         )
         self.prev_color = parent.get_color_values_hsbk()
         self.continuous = continuous
+        self._state_lock = threading.Lock()
         self.thread = ColorThread(target=self.match_color, args=(self.bulb,))
-        try:
-            label = self.bulb.get_label()
-        except:  # pylint: disable=bare-except
-            # If anything goes wrong in getting the label just set it to ERR; we really don't care except for logging.
-            label = "<LABEL-ERR>"
+        label = getattr(parent, "label", None) or "<LABEL-ERR>"
         self.logger.info(
             "Initialized Thread: Bulb: %s // Continuous: %s", label, self.continuous
         )
 
-    def match_color(self, bulb):
-        """ColorThread target which calls the 'change_color' function on the bulb."""
+    def match_color(self, bulb, initial_color, effect_kwargs, ticket=None):
+        """Calculate off-thread; Tk values are snapshotted by start()."""
+        worker = threading.current_thread()
+        prev_color = initial_color
         self.logger.debug("Starting color match.")
-        self.prev_color = (
-            self.parent.get_color_values_hsbk()
-        )  # coupling to LightFrame from gui.py here
-        while not self.thread.stopped():
-            try:
-                color = list(
-                    self.color_function(initial_color=self.prev_color, **self.kwargs)
-                )
-                color[2] = min(color[2] + self.get_brightness_offset(), 65535)
-                bulb.set_color(
-                    color, duration=self.get_duration() * 1000, rapid=self.continuous
-                )
-                self.prev_color = color
-            except OSError:
-                # This is dirty, but we really don't care, just keep going
-                self.logger.info("Hit an os error")
-                continue
-            if not self.continuous:
-                self.stop()
-        self.logger.debug("Color match finished.")
+        try:
+            with ExitStack() as resources:
+                if is_screen_effect(self.color_function):
+                    effect_kwargs["capture"] = resources.enter_context(mss.mss())
+                while not worker.stopped():
+                    started = time.monotonic()
+                    try:
+                        color = list(
+                            self.color_function(
+                                initial_color=prev_color, **effect_kwargs
+                            )
+                        )
+                        action = isinstance(self.color_function, ActionScreenColor)
+                        offset = (
+                            0
+                            if action and color[2] == 0
+                            else self.get_brightness_offset()
+                        )
+                        color[2] = max(0, min(color[2] + offset, 65535))
+                        if is_screen_effect(self.color_function):
+                            color[2] = limit_screen_brightness(color[2])
+                        if action:
+                            # Scale the final output rather than clip highlights;
+                            # the screen cutoff still refers to scene brightness.
+                            level = max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    get_action_sync_value("brightness", 100) / 100,
+                                ),
+                            )
+                            color[2] = round(color[2] * level)
+                        with self._state_lock:
+                            if worker is not self.thread or worker.stopped():
+                                break
+                            gate = getattr(
+                                getattr(self.parent, "master", None), "commands", None
+                            )
+
+                            def send(device):
+                                device.set_color(
+                                    color,
+                                    duration=(
+                                        self.get_action_transition_ms()
+                                        if action
+                                        else self.get_duration() * 1000
+                                    ),
+                                    rapid=self.continuous,
+                                )
+
+                            if gate is None:
+                                send(bulb)
+                            else:
+                                gate.write(bulb, send, ticket)
+                            prev_color = self.prev_color = color
+                    except OSError:
+                        self.logger.warning("Device/capture temporarily unavailable")
+                        worker._stop_event.wait(0.25)
+                        continue
+                    if not self.continuous:
+                        break
+                    # LIFX supports about 20 commands/sec. Transition duration
+                    # controls bulb interpolation, not how often this loop runs.
+                    worker._stop_event.wait(max(0, 0.05 - (time.monotonic() - started)))
+        except Exception:
+            self.logger.exception("Effect stopped after an error")
+        finally:
+            worker.stop()
+            post_ui = getattr(getattr(self.parent, "master", None), "post_ui", None)
+            if post_ui is not None:
+                post_ui(lambda: self.parent.effect_finished(self))
+            self.logger.debug("Color match finished.")
+
+    def is_running(self):
+        return self.thread.is_alive() and not self.thread.stopped()
 
     def start(self):
-        """Start the match_color thread"""
-        if self.thread.stopped():
-            self.thread = ColorThread(target=self.match_color, args=(self.bulb,))
-            self.thread.setDaemon(True)
-        try:
+        """Snapshot GUI inputs and start one worker; repeated starts are harmless."""
+        initial_color = list(self.parent.get_color_values_hsbk())
+        effect_kwargs = dict(self.kwargs)
+        if "func_bounds" in effect_kwargs:
+            bounds = get_monitor_bounds(effect_kwargs["func_bounds"])
+            effect_kwargs["func_bounds"] = lambda: bounds
+        if isinstance(self.color_function, ActionScreenColor):
+            effect_kwargs["processor"] = ActionProcessor()
+        with self._state_lock:
+            if self.is_running():
+                return
+            self.thread = ColorThread(
+                target=self.match_color,
+                args=(
+                    self.bulb,
+                    initial_color,
+                    effect_kwargs,
+                    (
+                        getattr(
+                            getattr(self.parent, "master", None), "commands", None
+                        ).ticket(self.bulb)
+                        if getattr(
+                            getattr(self.parent, "master", None), "commands", None
+                        )
+                        is not None
+                        else None
+                    ),
+                ),
+            )
             self.thread.start()
             self.logger.debug("Thread started.")
-        except RuntimeError:
-            self.logger.error("Tried to start ColorThread again.")
 
     def stop(self):
-        """Stop the match_color thread"""
-        self.thread.stop()
+        """Invalidate pending calculations before allowing another effect to send."""
+        with self._state_lock:
+            self.thread.stop()
+
+    @staticmethod
+    def get_action_transition_ms():
+        """Bridge 50 ms target updates with short, responsive lamp-side fades."""
+        response = max(0.0, min(1.0, get_action_sync_value("response", 90) / 100))
+        # Even the fastest response must interpolate between packets. Longer
+        # fades at lower Response soften motion without slowing frame capture.
+        return round(60 + 100 * (1 - response))
 
     @staticmethod
     def get_duration():
@@ -230,28 +391,7 @@ class ColorThreadRunner:
         return int(config["AverageColor"]["brightnessoffset"])
 
 
-def install_thread_excepthook():
-    """
-    Workaround for sys.excepthook thread bug
-    (https://sourceforge.net/tracker/?func=detail&atid=105470&aid=1230540&group_label=5470).
-    Call once from __main__ before creating any threads.
-    If using psyco, call psycho.cannotcompile(threading.Thread.run)
-    since this replaces a new-style class method.
-    """
-    import sys
-
-    run_old = threading.Thread.run
-
-    def run(*args, **kwargs):
-        """Monkey-patch for the run function that installs local excepthook"""
-        try:
-            run_old(*args, **kwargs)
-        except (KeyboardInterrupt, SystemExit):
-            raise
-        except:  # pylint: disable=bare-except
-            sys.excepthook(*sys.exc_info())
-
-    threading.Thread.run = run
-
-
-install_thread_excepthook()
+# Python's native hook also covers device and zone workers.
+threading.excepthook = lambda args: sys.excepthook(
+    args.exc_type, args.exc_value, args.exc_traceback
+)

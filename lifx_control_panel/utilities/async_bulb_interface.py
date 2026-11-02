@@ -31,28 +31,48 @@ class AsyncBulbInterface(threading.Thread):
         device_list: Sequence[
             Union[lifxlan.Device, lifxlan.Light, lifxlan.MultiZoneLight]
         ],
+        states=None,
     ):
         """Set internet device list to passed list of LIFX devices."""
+        prefetched = {id(state.device): state for state in states or []}
         for dev in device_list:
             try:
-                label = dev.get_label()
-                self.color_queue[label] = queue.Queue()
+                state = prefetched.get(id(dev))
+                label = (
+                    state.label if state is not None else getattr(dev, "label", None)
+                )
+                if label is None:
+                    label = dev.get_label()
+                self.color_queue[label] = queue.Queue(maxsize=1)
                 try:
-                    if dev.supports_multizone():
-                        dev: lifxlan.MultiZoneLight
-                        color = dev.get_color_zones()[0]
-                    else:
-                        color = getattr(dev, "color", None)
+                    color = (
+                        state.color
+                        if state is not None
+                        else getattr(dev, "color", None)
+                    )
+                    if (
+                        color is not None
+                        and len(color)
+                        and isinstance(color[0], (list, tuple))
+                    ):
+                        color = color[0]
                 except Exception as e:
                     self.logger.error(e)
                     color = None
-                self.color_cache[dev.label] = color
-                self.power_queue[dev.label] = queue.Queue()
+                self.color_cache[label] = tuple(color) if color is not None else None
+                self.power_queue[label] = queue.Queue(maxsize=1)
                 try:
-                    self.power_cache[dev.label] = dev.power_level or dev.get_power()
+                    power = (
+                        state.power
+                        if state is not None
+                        else getattr(dev, "power_level", None)
+                    )
+                    self.power_cache[label] = (
+                        dev.get_power() if power is None else power
+                    )
                 except Exception as e:
                     self.logger.error(e)
-                    self.power_cache[dev.label] = 0
+                    self.power_cache[label] = 0
                 self.device_list.append(cast(lifxlan.Device, dev))
             except lifxlan.WorkflowException as exc:
                 self.logger.warning(
@@ -62,16 +82,28 @@ class AsyncBulbInterface(threading.Thread):
     def query_device(self, target):
         """Check if target has new state. If it does, push it to the queue and cache the value."""
         try:
+            label = target.label
             pwr = target.get_power()
-            if pwr != self.power_cache[target.label]:
-                self.power_queue[target.label].put(pwr)
-                self.power_cache[target.label] = pwr
-            clr = target.get_color()
-            if clr != self.color_cache[target.label]:
-                self.color_queue[target.label].put(clr)
-                self.color_cache[target.label] = clr
+            if pwr != self.power_cache[label]:
+                self._publish_latest(self.power_queue[label], pwr)
+                self.power_cache[label] = pwr
+            # Poll only the representative colour; full strip palettes are
+            # fetched explicitly by discovery, Read zones and saved-state jobs.
+            clr = tuple(target.get_color())
+            if clr != self.color_cache[label]:
+                self._publish_latest(self.color_queue[label], clr)
+                self.color_cache[label] = clr
         except lifxlan.WorkflowException:
             pass
+
+    @staticmethod
+    def _publish_latest(target_queue, value):
+        """Keep the newest state when the GUI is slower than device polling."""
+        try:
+            target_queue.get_nowait()
+        except queue.Empty:
+            pass
+        target_queue.put_nowait(value)
 
     def run(self):
         """Continuous loop that has a thread query each device every HEARTBEAT ms."""
@@ -79,4 +111,6 @@ class AsyncBulbInterface(threading.Thread):
             max_workers=max(1, len(self.device_list))
         ) as executor:
             while not self.stopped.wait(self.hb_rate / 1000):
-                executor.map(self.query_device, self.device_list)
+                # Consume the batch before scheduling another: slow/offline lights
+                # must not accumulate overlapping queries in the executor queue.
+                list(executor.map(self.query_device, self.device_list))

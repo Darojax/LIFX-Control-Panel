@@ -2,81 +2,43 @@ name: Smoke Build And Test
 
 on:
   push:
-    branches:
-      - master
+    branches: [master]
   pull_request:
-    branches:
-      - master
+    branches: [master]
 
 jobs:
+  test:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Run offline tests
+        run: |
+          coverage run -m unittest discover -s lifx_control_panel/test -p "*test*.py"
+          coverage report
+          coverage xml -o coverage.xml
+      - uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.xml
+          fail_ci_if_error: false
   smoke-build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: Set up Python 3.8
-        uses: actions/setup-python@v1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.8.x' # Semantic version range syntax or exact version of a Python version
-          architecture: 'x64'
-      - name: Cache pip
-        uses: actions/cache@v1
-        with:
-          path: ~/.cache/pip # This path is specific to Ubuntu
-          # Look to see if there is a cache hit for the corresponding requirements file
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-            ${{ runner.os }}-
-      - name: Install swig
-        env:
-          ACTIONS_ALLOW_UNSECURE_COMMANDS: true
-        run: |
-          (New-Object System.Net.WebClient).DownloadFile("http://prdownloads.sourceforge.net/swig/swigwin-4.0.1.zip","swigwin-4.0.1.zip");
-          Expand-Archive .\swigwin-4.0.1.zip .;
-          echo "::add-path::./swigwin-4.0.1"
-      - name: Check swig
-        run: swig -version
-      - name: Install python and deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller==4.8
-      - name: Build Project
-        run: |
-          cd ./lifx_control_panel
-          set PYTHONOPTIMIZE=1 && pyinstaller --onefile --noupx build_all.spec
-          cd ..
-  
-  test:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v2
-      - name: Set up Python 3.8
-        uses: actions/setup-python@v1
-        with:
-          python-version: '3.8.x' # Semantic version range syntax or exact version of a Python version
-          architecture: 'x64'
-      - name: Cache pip
-        uses: actions/cache@v1
-        with:
-          path: ~/.cache/pip # This path is specific to Ubuntu
-          # Look to see if there is a cache hit for the corresponding requirements file
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-            ${{ runner.os }}-
-      - name: Test Project
-        run: |
-          pip3 install --user -r requirements.txt
-          pip3 install --user -r requirements-dev.txt
-          cd ./lifx_control_panel
-          set PYTHONPATH=.
-          coverage run -m unittest discover test -p "*test*.py"
-          coverage report
-          coverage xml -o coverage.xml
-          cd ..
-      - name: Upload Coverage to Codecov
-        uses: codecov/codecov-action@v2
-        with:
-          files: ./lifx_control_panel/coverage.xml
-          flags: unittests
+          python-version: '3.12'
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install -r requirements.txt "pyinstaller>=6.19,<7"
+      - name: Build executables
+        shell: cmd
+        run: build_all.bat

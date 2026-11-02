@@ -9,17 +9,19 @@ Notes
 """
 
 import logging
+import concurrent.futures
 import os
+import queue
 import sys
 import threading
 import tkinter
 import tkinter.colorchooser
 import traceback
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from logging.handlers import RotatingFileHandler
 from PIL import Image
 from tkinter import messagebox, ttk
-from typing import List, Dict, Union, Optional, cast
+from typing import Dict, Union, Optional, cast
 
 import pystray
 import lifxlan
@@ -29,7 +31,7 @@ from lifx_control_panel._constants import BUILD_DATE, AUTHOR, DEBUGGING, VERSION
 from lifx_control_panel.frames import LightFrame, MultiZoneFrame, GroupFrame
 from lifx_control_panel.ui import settings
 from lifx_control_panel.ui.icon_list import BulbIconList
-from lifx_control_panel.ui.settings import config
+from lifx_control_panel.ui.settings import config, save_config
 from lifx_control_panel.ui.theme import (
     THEME_PALETTES,
     apply_theme as apply_ui_theme,
@@ -38,12 +40,32 @@ from lifx_control_panel.ui.theme import (
     resolve_theme_mode,
 )
 from lifx_control_panel.utilities import audio
+from lifx_control_panel.utilities.device_actions import (
+    CommandGate,
+    KEYBIND_ACTIONS,
+    devices_in,
+    device_key,
+    capture_state,
+    decode_state,
+    restore_device,
+)
+from lifx_control_panel.utilities.desktop import configure_dpi
 from lifx_control_panel.utilities.async_bulb_interface import AsyncBulbInterface
 from lifx_control_panel.utilities.keypress import KeybindManager
+from lifx_control_panel.utilities.discovery import (
+    SCAN_ATTEMPTS,
+    prefetch_devices,
+    group_state,
+    install_socket_workaround,
+)
 from lifx_control_panel.utilities.utils import resource_path, Color, str2tuple
 
 # determine if application is a script file or frozen exe
-APPLICATION_PATH = os.path.dirname(__file__)
+APPLICATION_PATH = (
+    os.path.dirname(sys.executable)
+    if getattr(sys, "frozen", False)
+    else os.path.dirname(__file__)
+)
 
 LOGFILE = os.path.join(APPLICATION_PATH, LOGFILE)
 
@@ -62,6 +84,12 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         # Setup frame and grid
         ttk.Frame.__init__(self, master, padding="3 3 12 12")
         self.master = master
+        self._closing = False
+        self.commands = CommandGate()
+        self._action_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        self._tray_targets = ()
+        self._ui_queue = queue.Queue()
+        self.after(40, self._drain_ui_queue)
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.grid(column=0, row=0, sticky="nwes")
         self.columnconfigure(0, weight=1)
@@ -110,32 +138,22 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.bulb_icons.grid(row=2, column=1, sticky="w")
         self.bulb_icons.canvas.bind("<Button-1>", self.on_bulb_canvas_click)
         # Keep light-name in sync with drop-down selection
-        self.tk_light_name.trace("w", self.bulb_changed)
+        self.tk_light_name.trace_add("write", self.bulb_changed)
+        if self.tk_light_name.get():
+            self.bulb_changed()
 
         self.group_icons.grid(row=3, column=1, sticky="w")
         self.group_icons.canvas.bind("<Button-1>", self.on_bulb_canvas_click)
 
-        # Setup tray icon
-        def lambda_quit(self_):
-            """Build an anonymous function call w/ correct 'self' scope"""
-            return lambda *_, **__: self_.on_closing()
-
-        def lambda_adjust(self_):
-            return lambda *_, **__: self_._root_window().deiconify()
+        # Menus read an immutable snapshot; their callbacks enqueue UI actions.
+        tray_menu = self.build_tray_menu()
 
         def run_tray_icon():
-            """Allow SysTrayIcon in a separate thread"""
             image = Image.open(resource_path("res/icon_vector.ico"))
-
-            icon = pystray.Icon(
-                "LIFX Control Panel",
-                image,
-                menu=pystray.Menu(
-                    pystray.MenuItem("Open", lambda_adjust(self), default=True),
-                    pystray.MenuItem("Quit", lambda_quit(self)),
-                ),
-            )
-            icon.run()
+            icon = pystray.Icon("LIFX Control Panel", image, menu=tray_menu)
+            self.tray_icon = icon
+            if not self._closing:
+                icon.run()
 
         self.systray_thread = threading.Thread(target=run_tray_icon, daemon=True)
         self.systray_thread.start()
@@ -144,89 +162,127 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         # Setup keybinding listener
         self.key_listener = KeybindManager(self)
         for keypress, function in dict(config["Keybinds"]).items():
-            light, color = function.split(":")
-            color = (
-                Color(*globals()[color])
-                if color in globals().keys()
-                else str2tuple(color, int)
-            )
-            self.save_keybind(light, keypress, color)
+            try:
+                light, color = function.rsplit(":", 1)
+                if color not in KEYBIND_ACTIONS:
+                    color = (
+                        Color(*getattr(lifxlan, color))
+                        if hasattr(lifxlan, color)
+                        else str2tuple(color, int)
+                    )
+                self.save_keybind(light, keypress, color)
+            except (ValueError, TypeError) as exc:
+                self.logger.warning("Ignoring invalid shortcut %s: %s", keypress, exc)
 
         self.apply_theme(config.get("AppSettings", "theme", fallback="system"))
 
         # Start icon callback
         self.after(FRAME_PERIOD_MS, self.update_icons)
 
+        if config.getboolean("AppSettings", "restore_state_on_startup", fallback=False):
+            self.restore_state()
+
         # Minimize if in config
         if config.getboolean("AppSettings", "start_minimized"):
             self._root_window().withdraw()
 
     def scan_for_lights(self):
-        """Communicating with the interface Thread, attempt to find any new devices"""
-        # Stop and restart the bulb interface
-        stop_event: threading.Event = self.bulb_interface.stopped
-        if not stop_event.is_set():
-            stop_event.set()
-        discovered_devices = list(self.lifx.get_devices() or [])
-        device_list: List[lifxlan.Device] = [
-            cast(lifxlan.Device, dev)
-            for dev in discovered_devices
-            if not isinstance(dev, lifxlan.Group)
-        ]
-        if self.bulb_interface:
-            del self.bulb_interface
-        self.bulb_interface = AsyncBulbInterface(stop_event, HEARTBEAT_RATE_MS)
-        self.bulb_interface.set_device_list(device_list)
-        self.bulb_interface.daemon = True
-        stop_event.clear()
-        self.bulb_interface.start()
-
-        light: lifxlan.Device
-        for light in self.bulb_interface.device_list:
+        """Prefetch devices concurrently, then publish only complete GUI panels."""
+        if isinstance(self.lifx, lifxlan.LifxLAN):
+            install_socket_workaround()
+        discovered = None
+        for attempt in range(SCAN_ATTEMPTS):
             try:
-                product: str = lifxlan.product_map[light.get_product()]
-                label: str = light.get_label()
-                # light.get_color()
+                discovered = list(self.lifx.get_devices() or [])
+                break
+            except (lifxlan.WorkflowException, OSError) as exc:
+                self.logger.warning(
+                    "Discovery failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    SCAN_ATTEMPTS,
+                    exc,
+                )
+        if discovered is None:
+            # Preserve the working interface and panels after a failed rescan.
+            return
+        for frame in self.frame_map.values():
+            frame.stop_threads()
+        self.bulb_interface.stopped.set()
+        # Let an in-flight polling batch finish before issuing reads to those
+        # same devices again. Each generation retains its own stop event.
+        if self.bulb_interface.is_alive():
+            self.bulb_interface.join()
+        devices = [
+            device for device in discovered if not isinstance(device, lifxlan.Group)
+        ]
+
+        states = prefetch_devices(devices, logger=self.logger)
+        self.bulb_interface = AsyncBulbInterface(threading.Event(), HEARTBEAT_RATE_MS)
+        self.bulb_interface.set_device_list(
+            [state.device for state in states], states=states
+        )
+        groups = defaultdict(list)
+        for state in states:
+            light, label = state.device, state.label
+            try:
+                if label not in self.frame_map:
+                    frame_type = (
+                        MultiZoneFrame
+                        if hasattr(light, "get_color_zones")
+                        else LightFrame
+                    )
+                    frame = frame_type(self, light, initial_state=state)
+                    self.frame_map[label] = frame
+                    frame.grid_configure(row=1)
+                else:
+                    frame = self.frame_map[label]
+                    frame.target = light
+                    for runner in frame.threads.values():
+                        runner.bulb = light
+                # Registration follows successful construction, so a failure
+                # cannot leave a clickable icon with no corresponding panel.
                 self.device_map[label] = light
-                self.logger.info('Light found: %s: "%s"', product, label)
                 if label not in self.bulb_icons.bulb_dict:
                     self.bulb_icons.draw_bulb_icon(light, label)
-                if label not in self.frame_map:
-                    if light.supports_multizone():
-                        self.frame_map[label] = MultiZoneFrame(self, light)
-                    else:
-                        self.frame_map[label] = LightFrame(self, light)
-                    self.frame_map[label].grid_configure(row=1)
-                    self.current_lightframe = self.frame_map[label]
-                    try:
-                        self.bulb_icons.set_selected_bulb(label)
-                    except KeyError:
-                        self.group_icons.set_selected_bulb(label)
-                    self.logger.info(
-                        "Building new frame: %s", self.frame_map[label].get_label()
-                    )
-                group_label = light.get_group_label()
-                if group_label not in self.device_map.keys():
-                    self.build_group_frame(group_label)
-            except lifxlan.WorkflowException as exc:
-                self.logger.warning(
-                    "Error when communicating with LIFX device: %s", exc
-                )
-            except KeyError as exc:
-                self.logger.warning(
-                    "Unknown device: %s: %s", light.get_product(), light.get_label()
-                )
+                groups[state.group_label].append(state)
+            except (lifxlan.WorkflowException, OSError) as exc:
+                self.logger.warning("Unable to build panel for %s: %s", label, exc)
+        for label, members in groups.items():
+            self.build_group_frame(label, members)
+        self.bulb_interface.daemon = True
+        self.bulb_interface.start()
+        selected = self.tk_light_name.get()
+        if selected in self.frame_map:
+            self.bulb_changed()
+        elif self.frame_map:
+            self.tk_light_name.set(next(iter(self.frame_map)))
+            self.bulb_changed()
+        self._tray_targets = tuple(self.device_map.keys())
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.update_menu()
 
-    def build_group_frame(self, group_label: str):
-        group = cast(lifxlan.Group, self.lifx.get_devices_by_group(group_label))
-        self.device_map[group_label] = group
-        self.group_icons.draw_bulb_icon(None, group_label)
+    def build_group_frame(self, group_label, members):
+        if group_label in self.frame_map and not isinstance(
+            self.frame_map[group_label], GroupFrame
+        ):
+            self.logger.warning(
+                "Group label conflicts with a light label: %s", group_label
+            )
+            return
+        state = group_state(group_label, members)
+        if group_label not in self.frame_map:
+            frame = GroupFrame(self, state.device, initial_state=state)
+            self.frame_map[group_label] = frame
+            frame.grid_configure(row=1)
+        else:
+            frame = self.frame_map[group_label]
+            frame.target = state.device
+            for runner in frame.threads.values():
+                runner.bulb = state.device
+        self.device_map[group_label] = state.device
+        if group_label not in self.group_icons.bulb_dict:
+            self.group_icons.draw_bulb_icon(None, group_label)
         self.logger.info("Group found: %s", group_label)
-        self.frame_map[group_label] = GroupFrame(self, group)
-        self.frame_map[group_label].grid_configure(row=1)
-        self.logger.info(
-            "Building new frame: %s", self.frame_map[group_label].get_label()
-        )
 
     def bulb_changed(self, *_, **__):
         """Change current display frame when bulb icon is clicked."""
@@ -260,7 +316,10 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         x_canvas = canvas.canvasx(event.x)
         y_canvas = canvas.canvasy(event.y)
         item = canvas.find_closest(x_canvas, y_canvas)
-        light_name = canvas.gettags(item)[0]
+        tags = canvas.gettags(item) if item else ()
+        if not tags or tags[0] not in self.frame_map:
+            return
+        light_name = tags[0]
         self.tk_light_name.set(light_name)
         if not canvas.master.is_group:  # BulbIconList
             self.bulb_icons.set_selected_bulb(light_name)
@@ -281,16 +340,192 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.after(FRAME_PERIOD_MS, self.update_icons)
 
     def save_keybind(self, light, keypress, color):
-        """Builds a new anonymous function changing light to color when keypress is entered."""
+        def apply_color():
+            if light not in self.frame_map:
+                self.logger.warning("Shortcut target is unavailable: %s", light)
+                return
+            if isinstance(color, str) and color in KEYBIND_ACTIONS:
+                self.apply_action(light, color)
+            else:
+                self.frame_map[light].set_color(color)
 
-        def lambda_factory(self, light, color):
-            """https://stackoverflow.com/questions/938429/scope-of-lambda-functions-and-their-parameters"""
-            return lambda *_, **__: self.device_map[light].set_color(
-                color, duration=float(config["AverageColor"]["duration"])
+        def func():
+            self.post_ui(apply_color)
+
+        self.key_listener.register_function(keypress, func)
+
+    def run_device_job(self, function, completed=None):
+        if self._closing:
+            return
+
+        def run():
+            try:
+                result = function()
+            except Exception as exc:
+                self.logger.exception("Device action failed")
+                self.post_ui(
+                    lambda message=str(exc): messagebox.showerror(
+                        "Device action failed", message, parent=self.master
+                    )
+                )
+                return
+            if completed is not None:
+                self.post_ui(lambda: completed(result))
+
+        self._action_executor.submit(run)
+
+    def apply_action(self, label, action):
+        frame = self.frame_map.get(label)
+        if frame is None:
+            return
+        frame._stop_conflicting_effects()
+        target = frame.target
+        ticket = self.commands.ticket(target)
+
+        def change(device):
+            if action in ("On", "Off", "Toggle Power"):
+                power = 65535 if action == "On" else 0
+                if action == "Toggle Power":
+                    power = 0 if device.get_power() else 65535
+                device.set_power(power, rapid=False)
+            else:
+                from lifx_control_panel.utilities.multizone import set_zone_colors
+
+                step = 6554 if action == "Brightness Up" else -6554
+                if hasattr(device, "get_color_zones"):
+                    colors = [list(color) for color in device.get_color_zones()]
+                    for color in colors:
+                        color[2] = max(0, min(65535, color[2] + step))
+                    set_zone_colors(
+                        device,
+                        colors,
+                        cancelled=lambda: not self.commands.current(ticket),
+                    )
+                else:
+                    color = list(device.get_color())
+                    color[2] = max(0, min(65535, color[2] + step))
+                    device.set_color(
+                        color,
+                        duration=round(
+                            float(config["AverageColor"]["duration"]) * 1000
+                        ),
+                    )
+
+        def run():
+            if not self.commands.current(ticket):
+                return
+            if action == "Toggle Power" and isinstance(target, lifxlan.Group):
+                power = (
+                    0
+                    if any(device.get_power() for device in devices_in(target))
+                    else 65535
+                )
+                self.commands.write(
+                    target, lambda device: device.set_power(power, rapid=False), ticket
+                )
+            else:
+                self.commands.write(target, change, ticket)
+
+        self.run_device_job(run)
+
+    def all_power(self, power):
+        for label, frame in tuple(self.frame_map.items()):
+            if not isinstance(frame.target, lifxlan.Group):
+                self.apply_action(label, "On" if power else "Off")
+
+    def build_tray_menu(self):
+        def post(callback):
+            return lambda *args: self.post_ui(callback)
+
+        def lights():
+            return tuple(
+                pystray.MenuItem(
+                    label,
+                    pystray.Menu(
+                        pystray.MenuItem(
+                            "On", post(lambda name=label: self.apply_action(name, "On"))
+                        ),
+                        pystray.MenuItem(
+                            "Off",
+                            post(lambda name=label: self.apply_action(name, "Off")),
+                        ),
+                    ),
+                )
+                for label in self._tray_targets
             )
 
-        func = lambda_factory(self, light, color)
-        self.key_listener.register_function(keypress, func)
+        return pystray.Menu(
+            pystray.MenuItem("Open", post(self._root_window().deiconify), default=True),
+            pystray.MenuItem("All lights on", post(lambda: self.all_power(True))),
+            pystray.MenuItem("All lights off", post(lambda: self.all_power(False))),
+            pystray.MenuItem("Lights", pystray.Menu(lights)),
+            pystray.MenuItem("Quit", post(self.on_closing)),
+        )
+
+    def save_state(self):
+        devices = tuple(self.bulb_interface.device_list)
+
+        def capture():
+            saved = {}
+            for device in devices:
+                try:
+                    self.commands.write(
+                        device,
+                        lambda bulb: saved.update(
+                            {device_key(bulb): capture_state(bulb)}
+                        ),
+                    )
+                except (lifxlan.WorkflowException, OSError, ValueError) as exc:
+                    self.logger.warning("Unable to save state: %s", exc)
+            return saved
+
+        def store(saved):
+            if not config.has_section("SavedState"):
+                config.add_section("SavedState")
+            config["SavedState"].update(saved)
+            save_config()
+            self.logger.info("Saved %d light states", len(saved))
+
+        self.run_device_job(capture, store)
+
+    def restore_state(self):
+        saved = dict(config["SavedState"]) if config.has_section("SavedState") else {}
+        for label, frame in tuple(self.frame_map.items()):
+            if isinstance(frame.target, lifxlan.Group):
+                continue
+            value = saved.get(device_key(frame.target))
+            if value is None:
+                continue
+            try:
+                state = decode_state(value)
+            except (ValueError, TypeError, KeyError) as exc:
+                self.logger.warning(
+                    "Ignoring invalid saved state for %s: %s", label, exc
+                )
+                continue
+            frame._stop_conflicting_effects()
+            device = frame.target
+            ticket = self.commands.ticket(device)
+
+            def restore(target=device, snapshot=state, token=ticket):
+                self.commands.write(
+                    target,
+                    lambda bulb: restore_device(
+                        bulb,
+                        snapshot,
+                        cancelled=lambda: not self.commands.current(token),
+                    ),
+                    token,
+                )
+
+            def display(result, panel=frame, snapshot=state, token=ticket):
+                if self.commands.current(token):
+                    panel.apply_color_preview(snapshot["color"])
+                    panel.tk_power_var.set(bool(snapshot["power"]))
+                    if snapshot["zones"] and hasattr(panel, "display_zones"):
+                        panel.display_zones(snapshot["zones"])
+
+            self.run_device_job(restore, display)
 
     def delete_keybind(self, keycombo):
         """Deletes anonymous function from key_listener. Don't know why this is needed."""
@@ -300,25 +535,31 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         """Show the settings dialog box over the master window."""
         self.key_listener.shutdown()
         previous_audio_input = config.get("Audio", "InputIndex", fallback="")
-        settings.SettingsDisplay(self, "Settings")
-        if self.current_lightframe:
-            self.current_lightframe.update_user_dropdown()
+        try:
+            settings.SettingsDisplay(self, "Settings")
+        finally:
+            self.key_listener.restart()
+        for frame in self.frame_map.values():
+            frame.update_user_dropdown()
         current_audio_input = config.get("Audio", "InputIndex", fallback="")
         if (
             current_audio_input != previous_audio_input
             or not self.audio_interface.initialized
         ):
+            for frame in self.frame_map.values():
+                frame.threads["audio"].stop()
             self.audio_interface.init_audio(config)
         for frame in self.frame_map.values():
             frame.music_button.config(
                 state="normal" if self.audio_interface.initialized else "disabled"
             )
-        self.key_listener.restart()
 
     def apply_theme(self, preference: str):
         """Apply the selected UI theme to all existing widgets."""
         self._theme_applying = True
         resolved = apply_ui_theme(self.master, preference)
+        for frame in self.frame_map.values():
+            frame.refresh_effect_buttons()
         self._apply_menu_theme(THEME_PALETTES[resolve_theme_mode(preference)])
         self.master.after_idle(self._clear_theme_applying)
         self.logger.info("Theme set to %s (resolved: %s)", preference, resolved)
@@ -395,6 +636,13 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
                 activeforeground=palette["selection_fg"],
                 highlightbackground=palette["menu_bg"],
             )
+            for button in self.state_menu_buttons:
+                button.configure(
+                    bg=palette["menu_bg"],
+                    fg=palette["menu_fg"],
+                    activebackground=palette["selection"],
+                    activeforeground=palette["selection_fg"],
+                )
             self.file_separator.configure(bg=palette["border"])
         except tkinter.TclError:
             pass
@@ -449,6 +697,23 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
             command=lambda: self._run_file_menu_action(self.show_settings),
         )
         self.file_settings_button.pack(fill="x")
+        self.state_menu_buttons = []
+        for label, callback in (
+            ("Save current state", self.save_state),
+            ("Restore saved state", self.restore_state),
+        ):
+            button = tkinter.Button(
+                self.file_dropdown,
+                text=label,
+                anchor="w",
+                relief=tkinter.FLAT,
+                borderwidth=0,
+                padx=10,
+                pady=4,
+                command=lambda action=callback: self._run_file_menu_action(action),
+            )
+            button.pack(fill="x")
+            self.state_menu_buttons.append(button)
         self.file_separator = tkinter.Frame(self.file_dropdown, height=1, bd=0)
         self.file_separator.pack(fill="x", padx=2, pady=2)
         self.file_exit_button = tkinter.Button(
@@ -580,18 +845,51 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
 
     def on_closing(self):
         """Should always be called before the application exits. Shuts down all threads and closes the program."""
+        if self._closing:
+            return
+        self._closing = True
         self.logger.info("Shutting down.\n")
-        self.master.destroy()
+        for frame in self.frame_map.values():
+            frame.stop_threads()
         self.bulb_interface.stopped.set()
-        sys.exit(0)
+        if hasattr(self, "key_listener"):
+            self.key_listener.shutdown()
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.stop()
+        self._action_executor.shutdown(wait=False, cancel_futures=True)
+        self.audio_interface.close()
+        self.master.destroy()
+
+    def post_ui(self, callback):
+        """Workers enqueue actions; only the Tk thread touches widgets."""
+        if not self._closing:
+            self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self):
+        if self._closing:
+            return
+        for _ in range(100):
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                callback()
+            except Exception:
+                self.logger.exception("UI callback failed")
+            if self._closing:
+                return
+        self.after(40, self._drain_ui_queue)
 
 
-def main():
+def main(lifx_instance=None):
     """Start the GUI, bulb_interface, loggers, exception handling, and finally run the app"""
     root = None
     app_logger = logging.getLogger("root")
     try:
+        configure_dpi()
         root = tkinter.Tk()
+        root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72)
         root.withdraw()
         root.title("LIFX Control Panel")
         root.resizable(False, False)
@@ -622,20 +920,26 @@ def main():
 
         def custom_handler(type_, value, trace_back):
             """A custom exception handler that logs exceptions in the root window's logger."""
-            app_logger.exception(
+            app_logger.error(
                 "Uncaught exception: %s:%s:%s",
                 repr(type_),
                 str(value),
                 repr(trace_back),
+                exc_info=(type_, value, trace_back),
             )
 
         sys.excepthook = custom_handler
+        root.report_callback_exception = custom_handler
 
         lifxlan.light_products.append(38)  # TODO Hotfix for missing LIFX Beam
 
         LifxFrame(
             root,
-            lifxlan.LifxLAN(verbose=DEBUGGING),
+            (
+                lifx_instance
+                if lifx_instance is not None
+                else lifxlan.LifxLAN(verbose=DEBUGGING)
+            ),
             AsyncBulbInterface(threading.Event(), HEARTBEAT_RATE_MS),
         )
         if not config.getboolean("AppSettings", "start_minimized"):

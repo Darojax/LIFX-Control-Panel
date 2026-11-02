@@ -1,7 +1,9 @@
 import logging
+import queue
+import math
 import tkinter
 from tkinter import ttk, font as font, messagebox, _setit
-from typing import Union, List, Tuple, Dict, Mapping, cast
+from typing import Union, Tuple, Dict, Mapping
 
 import mouse
 import lifxlan
@@ -23,11 +25,11 @@ from lifxlan import (
 
 from lifx_control_panel import RED, FRAME_PERIOD_MS
 from lifx_control_panel.ui.colorscale import ColorScale
-from lifx_control_panel.ui.settings import config
+from lifx_control_panel.ui.settings import config, save_config
 from lifx_control_panel.utilities import color_thread
+from lifx_control_panel.utilities.discovery import prefetch_device, group_state
 from lifx_control_panel.utilities.color_thread import (
     get_screen_as_image,
-    normalize_rectangles,
 )
 from lifx_control_panel.utilities.utils import (
     Color,
@@ -76,7 +78,9 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
     min_kelvin: int = MIN_KELVIN_DEFAULT
     max_kelvin: int = MAX_KELVIN_DEFAULT
 
-    def __init__(self, master, target: Union[lifxlan.Device, lifxlan.Group]):
+    def __init__(
+        self, master, target: Union[lifxlan.Device, lifxlan.Group], initial_state=None
+    ):
         super().__init__(
             master,
             padding="3 3 12 12",
@@ -88,6 +92,9 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 relief=tkinter.RIDGE,
             ),
         )
+        self._initial_state = initial_state
+        self._color_send_job = None
+        self._pending_color = None
         self.icon_update_flag: bool = True
         # Initialize LightFrames
         bulb_power, init_color = self._get_light_info(target)
@@ -137,38 +144,20 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
     def _get_light_info(
         self, target: Union[lifxlan.Device, lifxlan.Group]
     ) -> Tuple[int, Color]:
-        bulb_power: int = 0
-        init_color: Color = Color(*lifxlan.WARM_WHITE)
-        try:
-            if isinstance(target, lifxlan.Group):
-                raise TypeError("Group target is not supported by LightFrame")
-            device = cast(lifxlan.Device, target)
-            self.label = device.get_label()
-            bulb_power = device.get_power()
-            if device.supports_multizone():
-                multizone_device = cast(lifxlan.MultiZoneLight, device)
-                init_color = Color(*multizone_device.get_color_zones()[0])
-            else:
-                light_device = cast(lifxlan.Light, device)
-                init_color = Color(*light_device.get_color())
-            self.min_kelvin = (
-                device.product_features.get("min_kelvin") or MIN_KELVIN_DEFAULT
-            )
-            self.max_kelvin = (
-                device.product_features.get("max_kelvin") or MAX_KELVIN_DEFAULT
-            )
-        except lifxlan.WorkflowException as exc:
-            messagebox.showerror(
-                f"Error building {self.__class__.__name__}",
-                f"Error thrown when trying to get label from bulb:\n{exc}",
-            )
-            self.master.on_closing()
-            # TODO Let this fail safely and try again later
-        return bulb_power, init_color
+        state = self._initial_state or prefetch_device(target)
+        if state is None:
+            # scan_for_lights decides whether to skip/retry this device; a
+            # single unreachable bulb must never terminate the whole app.
+            raise lifxlan.WorkflowException("Unable to read device state")
+        self._initial_state = state
+        self.label = state.label
+        self.min_kelvin = state.features.get("min_kelvin") or MIN_KELVIN_DEFAULT
+        self.max_kelvin = state.features.get("max_kelvin") or MAX_KELVIN_DEFAULT
+        return state.power, Color(*state.color)
 
     def _setup_screen_region_select(self):
         self.screen_region_lf = ttk.LabelFrame(
-            self, text="Screen Avg. Region", padding="3 3 12 12"
+            self, text="Screen Region", padding="3 3 12 12"
         )
         self.screen_region_entries = {
             "left": tkinter.Entry(self.screen_region_lf, width=6),
@@ -216,8 +205,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         )
 
         def start_color_cycle():
-            self.color_cycle_btn.config(bg="Green")
-            self.threads["cycle"].start()
+            self._start_effect("cycle", self.color_cycle_btn)
 
         self.color_cycle_btn = tkinter.Button(
             self.special_functions_lf,
@@ -225,6 +213,18 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             command=start_color_cycle,
         )
         self.color_cycle_btn.grid(row=9, column=0)
+        self.threads["action"] = color_thread.ColorThreadRunner(
+            self.target,
+            color_thread.ActionScreenColor(),
+            self,
+            func_bounds=self.get_monitor_bounds,
+        )
+        self.action_sync_btn = tkinter.Button(
+            self.special_functions_lf,
+            text="Cinema Sync",
+            command=lambda: self._start_effect("action", self.action_sync_btn),
+        )
+        self.action_sync_btn.grid(row=10, column=0)
         # Screen Avg.
         self.threads["screen"] = color_thread.ColorThreadRunner(
             self.target,
@@ -235,8 +235,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
         def start_screen_avg():
             """Allow the screen avg. to be run in a separate thread. Also turns button green while running."""
-            self.avg_screen_btn.config(bg="Green")
-            self.threads["screen"].start()
+            self._start_effect("screen", self.avg_screen_btn)
 
         self.avg_screen_btn = tkinter.Button(
             self.special_functions_lf,
@@ -258,8 +257,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         )
 
         def start_screen_dominant():
-            self.dominant_screen_btn.config(bg="Green")
-            self.threads["dominant"].start()
+            self._start_effect("dominant", self.dominant_screen_btn)
 
         self.dominant_screen_btn = tkinter.Button(
             self.special_functions_lf,
@@ -274,8 +272,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
         def start_audio():
             """Allow the audio to be run in a separate thread. Also turns button green while running."""
-            self.music_button.config(bg="Green")
-            self.threads["audio"].start()
+            self._start_effect("audio", self.music_button)
 
         self.music_button = tkinter.Button(
             self.special_functions_lf,
@@ -286,13 +283,10 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             ),
         )
         self.music_button.grid(row=8, column=0)
-        self.threads["eyedropper"] = color_thread.ColorThreadRunner(
-            self.target, self.eyedropper, self, continuous=False
-        )
         tkinter.Button(
             self.special_functions_lf,
             text="Color Eyedropper",
-            command=self.threads["eyedropper"].start,
+            command=self.eyedropper,
         ).grid(row=7, column=1)
         tkinter.Button(
             self.special_functions_lf, text="Stop effects", command=self.stop_threads
@@ -323,7 +317,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         )
         self.preset_dropdown.grid(row=0, column=0)
         self.preset_dropdown.configure(width=13)
-        self.color_var.trace("w", self.change_preset_dropdown)
+        self.color_var.trace_add("write", self.change_preset_dropdown)
         self.tk_user_def_color_var = tkinter.StringVar(self, value="User Presets")
         self.user_dropdown = tkinter.OptionMenu(
             self.preset_colors_lf,
@@ -335,8 +329,10 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             ),
         )
         self.user_dropdown.grid(row=0, column=1)
-        self.user_dropdown.config(width=13)
-        self.tk_user_def_color_var.trace("w", self.change_user_dropdown)
+        self.user_dropdown.config(
+            width=13, state="normal" if config["PresetColors"] else "disabled"
+        )
+        self.tk_user_def_color_var.trace_add("write", self.change_user_dropdown)
         self.preset_colors_lf.grid(row=5, columnspan=4)
 
     def setup_color_controls(self, init_color: Color):
@@ -351,25 +347,22 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         )
         self.current_color.grid(row=0, column=2)
         self.hsbk = (
-            tkinter.IntVar(self, init_color.hue, "Hue"),
-            tkinter.IntVar(self, init_color.saturation, "Saturation"),
-            tkinter.IntVar(self, init_color.brightness, "Brightness"),
-            tkinter.IntVar(self, init_color.kelvin, "Kelvin"),
+            tkinter.IntVar(self, init_color.hue),
+            tkinter.IntVar(self, init_color.saturation),
+            tkinter.IntVar(self, init_color.brightness),
+            tkinter.IntVar(self, init_color.kelvin),
         )
         for i in self.hsbk:
-            i.trace("w", self.trigger_icon_update)
-        self.hsbk_labels: Tuple[
-            tkinter.Label, tkinter.Label, tkinter.Label, tkinter.Label
-        ] = (
-            tkinter.Label(self, text=f"{360 * (self.hsbk[0].get() / 65535):.3g}"),
-            tkinter.Label(
-                self, text=str(f"{100 * self.hsbk[1].get() / 65535:.3g}") + "%"
-            ),
-            tkinter.Label(
-                self, text=str(f"{100 * self.hsbk[2].get() / 65535:.3g}") + "%"
-            ),
-            tkinter.Label(self, text=str(self.hsbk[3].get()) + " K"),
+            i.trace_add("write", self.trigger_icon_update)
+        self.hsbk_entry_vars = tuple(tkinter.StringVar(self) for _ in range(4))
+        self.hsbk_labels = tuple(
+            tkinter.Entry(self, textvariable=value, width=7, justify="right")
+            for value in self.hsbk_entry_vars
         )
+        for key, entry in enumerate(self.hsbk_labels):
+            entry.bind("<Return>", lambda event, index=key: self.commit_entry(index))
+            entry.bind("<FocusOut>", lambda event, index=key: self.commit_entry(index))
+            self.update_label(key, force=True)
         self.hsbk_scale: Tuple[ColorScale, ColorScale, ColorScale, ColorScale] = (
             ColorScale(
                 self,
@@ -453,7 +446,12 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         )
         scale: ColorScale
         for key, scale in enumerate(self.hsbk_scale):
-            tkinter.Label(self, text=self.hsbk[key]).grid(row=key + 1, column=0)
+            tkinter.Label(
+                self,
+                text=("Hue (degrees)", "Saturation (%)", "Brightness (%)", "Kelvin")[
+                    key
+                ],
+            ).grid(row=key + 1, column=0)
             scale.grid(row=key + 1, column=1)
             self.hsbk_labels[key].grid(row=key + 1, column=2)
             self.hsbk_display[key].grid(row=key + 1, column=3)
@@ -500,7 +498,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
     def restart(self):
         """Get updated information for the bulb when clicked."""
-        self.update_status_from_bulb()
+        self.update_status_from_bulb(run_once=True)
         self.logger.info("Light frame Restarted.")
 
     def get_label(self):
@@ -515,36 +513,139 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         """Get color values entered into GUI"""
         return Color(*tuple(v.get() for v in self.hsbk))
 
-    def stop_threads(self):
+    def _start_effect(self, name, button):
+        """Give one effect exclusive control of this light or group."""
+        self._stop_conflicting_effects()
+        try:
+            self.threads[name].start()
+        except (ValueError, tkinter.TclError) as exc:
+            messagebox.showerror("Unable to start effect", str(exc), parent=self)
+            return
+        self._active_effect = name
+        self.refresh_effect_buttons()
+
+    def _stop_conflicting_effects(self, keep_pending=False):
+        """A group and its individual lights must not compete for the same bulb."""
+
+        def device_ids(target):
+            devices = (
+                target.get_device_list()
+                if isinstance(target, lifxlan.Group)
+                else [target]
+            )
+            return {
+                getattr(device, "mac_addr", None) or id(device) for device in devices
+            }
+
+        own_devices = device_ids(self.target)
+        for frame in getattr(self.master, "frame_map", {}).values():
+            if frame is not self and own_devices & device_ids(frame.target):
+                frame.stop_threads(invalidate_commands=False)
+        self.stop_threads(cancel_pending=not keep_pending)
+
+    def refresh_effect_buttons(self):
+        """Restore theme colours while retaining the active effect indicator."""
+        buttons = {
+            "action": self.action_sync_btn,
+            "audio": self.music_button,
+            "screen": self.avg_screen_btn,
+            "dominant": self.dominant_screen_btn,
+            "cycle": self.color_cycle_btn,
+        }
+        for name, button in buttons.items():
+            active = name == getattr(self, "_active_effect", None)
+            background = button.option_get("background", "Button")
+            foreground = button.option_get("foreground", "Button")
+            button.config(
+                bg=(
+                    "Green"
+                    if active
+                    else background or button.configure("background")[3]
+                ),
+                fg=(
+                    "white"
+                    if active
+                    else foreground or button.configure("foreground")[3]
+                ),
+            )
+
+    def effect_finished(self, runner):
+        """Clear a finished effect on the GUI thread, including after a failure."""
+        name = getattr(self, "_active_effect", None)
+        if name and self.threads[name] is runner and not runner.is_running():
+            self._active_effect = None
+            self.refresh_effect_buttons()
+
+    def stop_threads(self, cancel_pending=True, invalidate_commands=True):
         """Stop all ColorRunner threads"""
-        self.music_button.config(bg="SystemButtonFace")
-        self.avg_screen_btn.config(bg="SystemButtonFace")
-        self.dominant_screen_btn.config(bg="SystemButtonFace")
-        self.color_cycle_btn.config(bg="SystemButtonFace")
+        if cancel_pending:
+            self._cancel_pending_color()
+        gate = getattr(self.master, "commands", None)
+        if gate is not None and invalidate_commands:
+            gate.invalidate(self.target)
         for thread in self.threads.values():
             thread.stop()
+        self._active_effect = None
+        self.refresh_effect_buttons()
+        self._cancel_eyedropper()
 
     def update_power(self):
         """Send new power state to bulb when UI is changed."""
-        self.stop_threads()
-        self.target.set_power(self.tk_power_var.get())
+        self.set_power(self.tk_power_var.get())
+
+    def set_power(self, power):
+        self._stop_conflicting_effects()
+        gate = getattr(self.master, "commands", None)
+        if gate is None:
+            self.target.set_power(power)
+        else:
+            gate.write(self.target, lambda device: device.set_power(power))
+        self.tk_power_var.set(bool(power))
 
     def update_color_from_ui(self, *_, **__):
         """Send new color state to bulb when UI is changed."""
-        self.stop_threads()
         self.set_color(self.get_color_values_hsbk(), rapid=True)
 
     def set_color(self, color, rapid=False):
         """Should be called whenever the bulb wants to change color. Sends bulb command and updates UI accordingly."""
-        self.stop_threads()
+        self._stop_conflicting_effects(keep_pending=rapid)
+        color = tuple(color)
+        if rapid:
+            self._pending_color = color
+            if self._color_send_job is None:
+                self._color_send_job = self.after(50, self._flush_color)
+        else:
+            self._send_color(color, rapid=False)
+
+    def _cancel_pending_color(self):
+        callback = getattr(self, "_color_send_job", None)
+        if callback is not None:
+            self.after_cancel(callback)
+        self._color_send_job = None
+        self._pending_color = None
+
+    def _flush_color(self):
+        self._color_send_job = None
+        color, self._pending_color = self._pending_color, None
+        if color is not None:
+            self._send_color(color, rapid=True)
+
+    def _send_color(self, color, rapid):
         try:
-            self.target.set_color(
-                color,
-                duration=(
-                    0 if rapid else float(config["AverageColor"]["duration"]) * 1000
-                ),
-                rapid=rapid,
+            duration = (
+                0 if rapid else round(float(config["AverageColor"]["duration"]) * 1000)
             )
+            gate = getattr(self.master, "commands", None)
+            if gate is None:
+                self.target.set_color(color, duration=duration, rapid=rapid)
+            else:
+                gate.write(
+                    self.target,
+                    lambda device: device.set_color(
+                        color, duration=duration, rapid=rapid
+                    ),
+                )
+            self.apply_color_preview(color)
         except lifxlan.WorkflowException as exc:
             if not rapid:
                 raise exc
@@ -553,20 +654,46 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 "Color changed to HSBK: %s", color
             )  # Don't pollute log with rapid color changes
 
-    def update_label(self, key: int):
-        """Update scale labels, formatted accordingly."""
-        return [
-            self.hsbk_labels[0].config(
-                text=str(f"{360 * (self.hsbk[0].get() / 65535):.3g}")
-            ),
-            self.hsbk_labels[1].config(
-                text=str(f"{100 * (self.hsbk[1].get() / 65535):.3g}") + "%"
-            ),
-            self.hsbk_labels[2].config(
-                text=str(f"{100 * (self.hsbk[2].get() / 65535):.3g}") + "%"
-            ),
-            self.hsbk_labels[3].config(text=str(self.hsbk[3].get()) + " K"),
-        ][key]
+    def apply_color_preview(self, color, update_zones=True):
+        for key, value in enumerate(color):
+            self.hsbk[key].set(value)
+            self.update_label(key)
+            self.update_display(key)
+        self.current_color.config(background=tuple2hex(hsbk_to_rgb(color)))
+        if update_zones and hasattr(self, "zone_colors"):
+            self.display_zones([tuple(color)] * len(self.zone_colors))
+
+    def update_label(self, key, force=False):
+        if not force and self.focus_get() is self.hsbk_labels[key]:
+            return
+        value = self.hsbk[key].get()
+        value = (
+            value * 360 / 65535
+            if key == 0
+            else value * 100 / 65535 if key in (1, 2) else value
+        )
+        self.hsbk_entry_vars[key].set(f"{value:.4g}")
+
+    def commit_entry(self, key):
+        try:
+            value = float(self.hsbk_entry_vars[key].get())
+            if not math.isfinite(value):
+                raise ValueError("Non-finite colour value")
+            value = (
+                round(value * 65535 / 360)
+                if key == 0
+                else round(value * 65535 / 100) if key in (1, 2) else round(value)
+            )
+            value = max(
+                int(self.hsbk_scale[key].min), min(int(self.hsbk_scale[key].max), value)
+            )
+        except (ValueError, OverflowError):
+            self.update_label(key, force=True)
+            return
+        if value != self.hsbk[key].get():
+            self.hsbk[key].set(value)
+            self.update_color_from_ui()
+        self.update_label(key, force=True)
 
     def update_display(self, key: int):
         """Update color swatches to match current device state"""
@@ -616,12 +743,20 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         run_once - Don't call `after` statement at end. Keeps a million workers from being instanced.
         """
         require_icon_update = False
-        power_queue = self.master.bulb_interface.power_queue
-        if (
-            self.label in power_queue
-            and not self.master.bulb_interface.power_queue[self.label].empty()
-        ):
-            power = self.master.bulb_interface.power_queue[self.label].get()
+
+        def newest(queues):
+            values = queues.get(self.label)
+            if values is None:
+                return None
+            latest = None
+            while True:
+                try:
+                    latest = values.get_nowait()
+                except queue.Empty:
+                    return latest
+
+        power = newest(self.master.bulb_interface.power_queue)
+        if power is not None:
             require_icon_update = True
             self.tk_power_var.set(power)
             if self.tk_power_var.get() == 0:
@@ -632,12 +767,8 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 self.option_on.select()
                 self.option_off.selection_clear()
 
-        color_queue = self.master.bulb_interface.color_queue
-        if (
-            self.label in color_queue
-            and not self.master.bulb_interface.color_queue[self.label].empty()
-        ):
-            hsbk = self.master.bulb_interface.color_queue[self.label].get()
+        hsbk = newest(self.master.bulb_interface.color_queue)
+        if hsbk is not None:
             require_icon_update = True
             for key, _ in enumerate(self.hsbk):
                 self.hsbk[key].set(hsbk[key])
@@ -651,52 +782,82 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             self.after(FRAME_PERIOD_MS, self.update_status_from_bulb)
 
     def eyedropper(self, *_, **__):
-        """Allows user to select a color pixel from the screen."""
-        self.master.master.withdraw()  # Hide window
-        state_left = win32api.GetKeyState(
-            0x01
-        )  # Left button down = 0 or 1. tkinter.Button up = -127 or -128
-        while True:
-            action = win32api.GetKeyState(0x01)
-            if action != state_left:  # tkinter.Button state changed
-                state_left = action
-                if action >= 0:
-                    break
-            lifxlan.sleep(0.001)
-        # tkinter.Button state changed
-        screen_img = get_screen_as_image()
-        cursor_pos = mouse.get_position()
-        # Convert display coords to image coords
-        cursor_pos = normalize_rectangles(
-            get_display_rects() + [(cursor_pos[0], cursor_pos[1], 0, 0)]
-        )[-1][:2]
-        color = screen_img.getpixel(cursor_pos)
-        self.master.master.deiconify()  # Reshow window
-        self.logger.info("Eyedropper color found RGB %s", color)
-        return lifxlan.RGBtoHSBK(color, temperature=self.get_color_values_hsbk().kelvin)
+        """Wait for a click without accessing Tk from an effect worker."""
+        self._stop_conflicting_effects()
+        self._eyedropper_root = self.winfo_toplevel()
+        self._eyedropper_was_down = False
+        self._eyedropper_root.withdraw()
+        self._eyedropper_after_id = self.after(10, self._poll_eyedropper)
+
+    def _cancel_eyedropper(self):
+        callback = getattr(self, "_eyedropper_after_id", None)
+        if callback is not None:
+            self.after_cancel(callback)
+            self._eyedropper_after_id = None
+        root = getattr(self, "_eyedropper_root", None)
+        if root is not None:
+            self._eyedropper_root = None
+            root.deiconify()
+
+    def _poll_eyedropper(self):
+        self._eyedropper_after_id = None
+        if win32api.GetAsyncKeyState(0x1B) & 0x8000:  # Escape cancels selection.
+            self._cancel_eyedropper()
+            return
+        down = bool(win32api.GetAsyncKeyState(0x01) & 0x8000)
+        if down:
+            self._eyedropper_was_down = True
+        if self._eyedropper_was_down and not down:
+            try:
+                screen_img = get_screen_as_image()
+                x_pos, y_pos = mouse.get_position()
+                left, top, _, _ = get_display_rects()[0]
+                color = screen_img.getpixel((x_pos - left, y_pos - top))
+                self.set_color(
+                    lifxlan.RGBtoHSBK(
+                        color, temperature=self.get_color_values_hsbk().kelvin
+                    )
+                )
+            except (OSError, ValueError, IndexError) as exc:
+                messagebox.showerror("Unable to pick colour", str(exc), parent=self)
+            finally:
+                self._cancel_eyedropper()
+            return
+        self._eyedropper_after_id = self.after(10, self._poll_eyedropper)
 
     def change_preset_dropdown(self, *_, **__):
         """Change device color to selected preset option."""
         color = Color(*globals()[self.color_var.get()])
-        self.preset_dropdown.config(
-            bg=tuple2hex(hsbk_to_rgb(color)),
-            activebackground=tuple2hex(hsbk_to_rgb(color)),
-        )
+        self._style_color_dropdown(self.preset_dropdown, color)
         self.set_color(color, False)
 
     def change_user_dropdown(self, *_, **__):
         """Change device color to selected user-defined option."""
         color = str2tuple(config["PresetColors"][self.tk_user_def_color_var.get()], int)
-        self.user_dropdown.config(
-            bg=tuple2hex(hsbk_to_rgb(color)),
-            activebackground=tuple2hex(hsbk_to_rgb(color)),
-        )
+        self._style_color_dropdown(self.user_dropdown, color)
         self.set_color(color, rapid=False)
+
+    @staticmethod
+    def _style_color_dropdown(dropdown, color):
+        red, green, blue = hsbk_to_rgb(color)
+        foreground = (
+            "black" if 0.299 * red + 0.587 * green + 0.114 * blue > 145 else "white"
+        )
+        background = tuple2hex((red, green, blue))
+        dropdown.config(
+            bg=background,
+            fg=foreground,
+            activebackground=background,
+            activeforeground=foreground,
+        )
 
     def update_user_dropdown(self):
         """Add newly defined color to the user color dropdown menu."""
         # self.tk_user_def_color_var.set('')
         self.user_dropdown["menu"].delete(0, "end")
+        self.user_dropdown.config(
+            state="normal" if config["PresetColors"] else "disabled"
+        )
 
         for choice in config["PresetColors"]:
             self.user_dropdown["menu"].add_command(
@@ -712,56 +873,124 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
     def save_monitor_bounds(self):
         """Write monitor bounds entered into the UI into the config file."""
+        try:
+            color_thread.validate_monitor_bounds(self.get_monitor_bounds())
+        except ValueError as exc:
+            messagebox.showerror("Invalid screen region", str(exc), parent=self)
+            return
         config["AverageColor"][self.label] = self.get_monitor_bounds()
         # Write to config file
-        with open("config.ini", "w", encoding="utf-8") as cfg:
-            config.write(cfg)
+        save_config()
 
 
 class GroupFrame(LightFrame):
     def _get_light_info(self, target: lifxlan.Group) -> Tuple[int, Color]:
-        bulb_power: int = 0
-        init_color: Color = Color(*lifxlan.WARM_WHITE)
-        try:
-            devices: List[
-                Union[lifxlan.Group, lifxlan.Light, lifxlan.MultiZoneLight]
-            ] = target.get_device_list()
-            if not devices:
-                logging.error("No devices found in group list")
-                self.label = "<No Group Found>"
-                self.min_kelvin, self.max_kelvin = 0, 99999  # arbitrary range
-                return 0, Color(0, 0, 0, 0)
-
-            self.label = devices[0].get_group_label()
-            bulb_power = devices[0].get_power()
-            # Find an init_color- ensure device has color attribute, otherwise fallback
-            color_devices: List[
-                Union[lifxlan.Group, lifxlan.Light, lifxlan.MultiZoneLight]
-            ] = list(filter(lambda d: d.supports_color(), devices))
-            if color_devices and hasattr(color_devices[0], "get_color"):
-                init_color = Color(*color_devices[0].get_color())
-            self.min_kelvin = min(
-                device.product_features.get("min_kelvin") or MIN_KELVIN_DEFAULT
-                for device in target.get_device_list()
-            )
-
-            self.max_kelvin = max(
-                device.product_features.get("max_kelvin") or MAX_KELVIN_DEFAULT
-                for device in target.get_device_list()
-            )
-
-        except lifxlan.WorkflowException as exc:
-            messagebox.showerror(
-                f"Error building {self.__class__.__name__}",
-                f"Error thrown when trying to get label from bulb:\n{exc}",
-            )
-            self.master.on_closing()
-            # TODO Let this fail safely and try again later
-        return bulb_power, init_color
+        state = self._initial_state
+        if state is None:
+            states = [prefetch_device(device) for device in target.get_device_list()]
+            states = [member for member in states if member is not None]
+            if not states:
+                raise lifxlan.WorkflowException("No reachable devices in group")
+            state = group_state(states[0].group_label, states)
+        self.label = state.label
+        self.min_kelvin = state.features.get("min_kelvin") or MIN_KELVIN_DEFAULT
+        self.max_kelvin = state.features.get("max_kelvin") or MAX_KELVIN_DEFAULT
+        return state.power, Color(*state.color)
 
     def update_status_from_bulb(self, run_once=False):
         return
 
 
 class MultiZoneFrame(LightFrame):
-    pass
+    def __init__(self, master, target, initial_state=None):
+        super().__init__(master, target, initial_state)
+        self.zone_colors = list(
+            self._initial_state.zones or [tuple(self.get_color_values_hsbk())]
+        )
+        group = ttk.LabelFrame(self, text="Zones (drag to paint)", padding=4)
+        group.grid(row=8, columnspan=4, sticky="ew")
+        self.zone_canvas = tkinter.Canvas(
+            group, width=360, height=28, highlightthickness=0
+        )
+        self.zone_canvas.pack(fill="x")
+        self.zone_canvas.bind("<Button-1>", self.paint_zone)
+        self.zone_canvas.bind("<B1-Motion>", self.paint_zone)
+        self.zone_canvas.bind("<ButtonRelease-1>", self.commit_zones)
+        self.zone_canvas.bind(
+            "<Configure>", lambda event: self.display_zones(self.zone_colors)
+        )
+        tkinter.Button(group, text="Read zones", command=self.read_zones).pack(
+            anchor="w"
+        )
+        self.display_zones(self.zone_colors)
+
+    def display_zones(self, colors):
+        self.zone_colors = [tuple(color) for color in colors]
+        self.zone_canvas.delete("all")
+        width = max(self.zone_canvas.winfo_width(), 360)
+        self.zone_width = width / len(self.zone_colors)
+        self.zone_rects = [
+            self.zone_canvas.create_rectangle(
+                index * self.zone_width,
+                0,
+                (index + 1) * self.zone_width,
+                28,
+                fill=tuple2hex(hsbk_to_rgb(color)),
+                outline="",
+            )
+            for index, color in enumerate(self.zone_colors)
+        ]
+
+    def update_color_from_ui(self, *args):
+        self._stop_conflicting_effects()
+        self.apply_color_preview(self.get_color_values_hsbk(), update_zones=False)
+
+    def paint_zone(self, event):
+        self._stop_conflicting_effects()
+        index = int(event.x // self.zone_width)
+        if 0 <= index < len(self.zone_colors):
+            color = tuple(self.get_color_values_hsbk())
+            self.zone_colors[index] = color
+            self.zone_canvas.itemconfigure(
+                self.zone_rects[index], fill=tuple2hex(hsbk_to_rgb(color))
+            )
+
+    def commit_zones(self, event=None):
+        from .utilities.multizone import set_zone_colors
+
+        self._stop_conflicting_effects()
+        colors, target = list(self.zone_colors), self.target
+        gate = getattr(self.master, "commands", None)
+        ticket = gate.ticket(target) if gate else None
+
+        def send():
+            if gate:
+                gate.write(
+                    target,
+                    lambda device: set_zone_colors(
+                        device, colors, cancelled=lambda: not gate.current(ticket)
+                    ),
+                    ticket,
+                )
+            else:
+                set_zone_colors(target, colors)
+
+        self.master.run_device_job(send)
+
+    def read_zones(self):
+        self._stop_conflicting_effects()
+        target, gate = self.target, self.master.commands
+        ticket = gate.ticket(target)
+
+        def read():
+            result = []
+            gate.write(
+                target, lambda device: result.extend(device.get_color_zones()), ticket
+            )
+            return result
+
+        def display(colors):
+            if colors and gate.current(ticket):
+                self.display_zones(colors)
+
+        self.master.run_device_job(read, display)

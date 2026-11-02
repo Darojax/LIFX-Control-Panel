@@ -1,35 +1,24 @@
 """This is not a standard test file (yet), but used to simulate a multi-device environment."""
 
-import logging
-import os
+import itertools
 import time
-import traceback
-from tkinter import *
-from tkinter import messagebox
 from typing import Iterable
 
 from lifxlan import Group
 
-from utilities.utils import Color as DummyColor
-from utilities.utils import resource_path
-
-LOGFILE = "lifx-control-panel.log"
-
-# determine if application is a script file or frozen exe
-if getattr(sys, "frozen", False):
-    application_path = os.path.dirname(sys.executable)
-elif __file__:
-    application_path = os.path.dirname(__file__)
-
-LOGFILE = os.path.join(application_path, LOGFILE)
+from lifx_control_panel.utilities.utils import Color as DummyColor
 
 
 # Dummy classes
 class DummyDevice:
+    _ids = itertools.count(1)
+
     def __init__(self, label="No label"):
         self.label = label
         self.power = False
-        self.mac_addr = "00:16:3e:2a:8d:00"
+        serial = next(self._ids)
+        self.mac_addr = "00:16:3e:2a:%02x:%02x" % (serial // 256, serial % 256)
+        self.product_features = {"min_kelvin": 1500, "max_kelvin": 9000}
         self.ip_addr = "63.218.207.187"
         self.build_timestamp = 1521690429000000000
         self.version = 2.75
@@ -196,7 +185,7 @@ class DummyDevice:
         return True
 
     def supports_multizone(self):
-        return True
+        return False
 
     def supports_infrared(self):
         return True
@@ -226,7 +215,7 @@ class DummyBulb(DummyDevice):
         self.power = val
 
     def set_color(self, val: DummyColor, duration: int = 0, rapid: bool = False):
-        self.color = val
+        self.color = val if isinstance(val, DummyColor) else DummyColor(*val)
         return self.get_color()
 
     def set_waveform(self, is_transient, color, period, cycles, duty_cycle, waveform):
@@ -258,19 +247,31 @@ class DummyBulb(DummyDevice):
 
 
 class MultiZoneDummy(DummyBulb):
-    def __init__(self, color=DummyColor(0, 0, 0, 1500), label="N/A"):
+    def __init__(self, color=None, label="N/A", num_zones=8):
         super().__init__(color, label)
+        self.zones = [tuple(self.color)] * num_zones
+        self.supports_extended_multizone = False
 
-    # Multizone API
+    def supports_multizone(self):
+        return True
 
-    def get_color_zones(self, start=0, end=0):
-        pass
+    def get_color(self):
+        return DummyColor(*self.zones[0])
+
+    def get_color_zones(self, start=None, end=None):
+        return list(self.zones if start is None else self.zones[start:end])
+
+    def set_color(self, val, duration=0, rapid=False):
+        super().set_color(val, duration, rapid)
+        if hasattr(self, "zones"):
+            self.zones = [tuple(val)] * len(self.zones)
 
     def set_zone_color(self, start, end, color, duration=0, rapid=False, apply=1):
-        pass
+        for index in range(start, min(end + 1, len(self.zones))):
+            self.zones[index] = tuple(color)
 
     def set_zone_colors(self, colors, duration=0, rapid=False):
-        pass
+        self.zones = [tuple(color) for color in colors]
 
 
 class TileDummy(DummyBulb):
@@ -351,8 +352,11 @@ class LifxLANDummy:
         self.devices[light.get_label()] = light
 
     # Official api
-    def get_lights(self):
+    def get_devices(self):
         return tuple(self.devices.values())
+
+    def get_lights(self):
+        return self.get_devices()
 
     def get_color_lights(self):
         return tuple(light for light in self.devices.values() if light.supports_color())
@@ -395,26 +399,26 @@ class LifxLANDummy:
         )
 
     def set_power_all_lights(self, power, duration=0, rapid=False):
-        for light in self.devices:
+        for light in self.devices.values():
             light.set_power(power)
 
     def set_color_all_lights(self, color, duration=0, rapid=False):
-        for light in self.devices:
+        for light in self.devices.values():
             light.set_color(color)
 
     def set_waveform_all_lights(
         self, is_transient, color, period, cycles, duty_cycle, wavform, rapid=False
     ):
-        for light in self.devices:
+        for light in self.devices.values():
             light.set_waveform(
                 is_transient, color, period, cycles, duty_cycle, wavform, rapid
             )
 
     def get_power_all_lights(self):
-        return dict([((light, light.get_power()) for light in self.devices)])
+        return dict([((light, light.get_power()) for light in self.devices.values())])
 
     def get_color_all_lights(self):
-        return dict([((light, light.get_color()) for light in self.devices)])
+        return dict([((light, light.get_color()) for light in self.devices.values())])
 
 
 class DummyGroup:
@@ -454,7 +458,7 @@ class DummyGroup:
 
     def set_brightness(self, brightness, duration=0, rapid=False):
         for device in self.devices:
-            device.set_hue(brightness, duration, rapid)
+            device.set_brightness(brightness, duration, rapid)
 
     def set_saturation(self, saturation, duration=0, rapid=False):
         for device in self.devices:
@@ -478,69 +482,26 @@ class DummyGroup:
 
 
 def main():
-    from lifxlan import LifxLAN
-    from ..__main__ import LifxFrame
+    """Run a strictly offline demo with ten simulated lights."""
+    from lifx_control_panel.__main__ import main as start_app
 
-    # Build mixed list of fake and real lights
     lifx = LifxLANDummy()
-    lifx.add_dummy_light(DummyBulb(label="A Light"))
-    lifx.add_dummy_light(DummyBulb(label="B Light"))
-    lifx.add_dummy_light(DummyBulb(label="C Light"))
-    lifx.add_dummy_light(DummyBulb(label="D Light"))
-    lifx.add_dummy_light(DummyBulb(label="E Light"))
-    lifx.add_dummy_light(DummyBulb(label="F Light"))
-    lifx.add_dummy_light(DummyBulb(label="G Light"))
-    lifx.add_dummy_light(DummyBulb(label="H Light"))
-    lifx.add_dummy_light(DummyBulb(label="I Light"))
-    lifx.add_dummy_light(DummyBulb(label="J Light"))
-    for light in LifxLAN().get_lights():
-        lifx.add_dummy_light(light)
-
-    root = Tk()
-    root.title("LIFX Control Panel")
-
-    # Setup main_icon
-    root.iconbitmap(resource_path("res/icon_vector.ico"))
-
-    root.logger = logging.getLogger("root")
-    root.logger.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(LOGFILE, mode="w")
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-    fh.setFormatter(formatter)
-    sh = logging.StreamHandler()
-    sh.setLevel(logging.DEBUG)
-    sh.setFormatter(formatter)
-    root.logger.addHandler(sh)
-    root.logger.info("Logger initialized.")
-
-    mainframe = LifxFrame(root, lifx)
-
-    # Setup exception logging
-    logger = mainframe.logger
-
-    def myHandler(type, value, tb):
-        logger.exception(
-            "Uncaught exception: {}:{}:{}".format(repr(type), str(value), repr(tb))
-        )
-
-    # sys.excepthook = myHandler  # dont' want to log exceptions when we're testing
-
-    # Run main app
-    root.mainloop()
+    for label in (
+        "A Light",
+        "B Light",
+        "C Light",
+        "D Light",
+        "E Light",
+        "F Light",
+        "G Light",
+        "H Light",
+        "I Light",
+        "J Light",
+    ):
+        lifx.add_dummy_light(DummyBulb(label=label))
+    lifx.add_dummy_light(MultiZoneDummy(label="Demo Strip", num_zones=16))
+    start_app(lifx_instance=lifx)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        messagebox.showerror(
-            "Unhandled Exception",
-            "Unhandled runtime exception: {}\n\n"
-            "Please report this at: {}".format(
-                traceback.format_exc(),
-                r"https://github.com/samclane/LIFX-Control-Panel/issues",
-            ),
-        )
-        raise e
+    main()

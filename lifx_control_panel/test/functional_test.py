@@ -1,5 +1,5 @@
 import unittest
-from utilities.utils import (
+from lifx_control_panel.utilities.utils import (
     Color,
     hsbk_to_rgb,
     hsv_to_rgb,

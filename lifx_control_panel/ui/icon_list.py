@@ -5,6 +5,7 @@ import tkinter
 from tkinter import ttk
 from typing import Dict, Union
 from PIL import Image as pImage
+from io import BytesIO
 
 import lifxlan
 from ..utilities import utils
@@ -53,8 +54,16 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
             height=self.settings.icon_height,
             **kwargs,
         )
+        self.scale = max(0.75, self.winfo_fpixels("1i") / 96)
+        self.icon_base_height = round(75 * self.scale)
+        self.settings.window_width = round(self.settings.window_width * self.scale)
+        self.settings.icon_width = round(90 * self.scale)
+        self.settings.icon_height = round(105 * self.scale)
+        self.settings.icon_padding = max(
+            1, round(self.settings.icon_padding * self.scale)
+        )
         self.scroll_x = 0
-        self.scroll_y = 0
+        self.scroll_y = self.settings.icon_height
         self.bulb_dict: dict[str, tuple[tkinter.PhotoImage, int, int]] = {}
         self.canvas = tkinter.Canvas(
             self,
@@ -74,7 +83,15 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
         self.canvas.pack(side=tkinter.LEFT, expand=True, fill=tkinter.BOTH)
         self.current_icon_width = 0
         path = self.icon_path()
-        self.original_icon = pImage.open(path).load()
+        with pImage.open(path) as image:
+            self._icon_source = image.resize(
+                (
+                    max(1, round(image.width * self.scale)),
+                    max(1, round(image.height * self.scale)),
+                ),
+                pImage.Resampling.NEAREST,
+            )
+        self.original_icon = self._icon_source.load()
         self._current_icon = None
 
     @property
@@ -105,27 +122,37 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
         self.scroll_x += self.settings.icon_width
         self.canvas.configure(scrollregion=(0, 0, self.scroll_x, self.scroll_y))
         # Build icon
-        path = self.icon_path()
-        sprite = tkinter.PhotoImage(file=path, master=self.master)
+        buffer = BytesIO()
+        self._icon_source.save(buffer, format="PNG")
+        sprite = tkinter.PhotoImage(data=buffer.getvalue(), master=self.master)
         image = self.canvas.create_image(
             (
                 self.current_icon_width
                 + self.settings.icon_width
                 - self.settings.icon_padding,
-                self.settings.icon_height / 2 + 2 * self.settings.icon_padding,
+                self.icon_base_height / 2 + 2 * self.settings.icon_padding,
             ),
             image=sprite,
             anchor=tkinter.SE,
             tags=[label],
         )
         text = self.canvas.create_text(
-            self.current_icon_width + self.settings.icon_padding / 2,
-            self.settings.icon_height / 2 + 2 * self.settings.icon_padding,
-            text=label[:8],
+            self.current_icon_width + self.settings.icon_width / 2,
+            self.icon_base_height / 2 + 2 * self.settings.icon_padding,
+            text=label,
+            width=self.settings.icon_width - 2 * self.settings.icon_padding,
+            justify=tkinter.CENTER,
             fill=self._get_contrasting_text_color(),
-            anchor=tkinter.NW,
+            anchor=tkinter.N,
             tags=[label],
         )
+        self.canvas.update_idletasks()
+        bounds = self.canvas.bbox(text)
+        if bounds:
+            self.scroll_y = max(self.scroll_y, bounds[3] + self.settings.icon_padding)
+            self.canvas.configure(
+                height=self.scroll_y, scrollregion=(0, 0, self.scroll_x, self.scroll_y)
+            )
         self.bulb_dict[label] = (sprite, image, text)
         self.update_icon(bulb)
         # update sizing info
@@ -148,11 +175,12 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
             bulb_power = self.master.bulb_interface.power_cache[bulb.label]
             bulb_brightness = bulb_color[2]
             sprite, image, _ = self.bulb_dict[bulb.label]
-        except TypeError:
+        except (TypeError, KeyError):
             # First run will give us None; Is immediately corrected on next pass
             return
         # Calculate what number, 0-11, corresponds to current brightness
         brightness_scale = (int((bulb_brightness / 65535) * 10) * (bulb_power > 0)) - 1
+        rendered_color = utils.hsbk_to_rgb(bulb_color)
         color_string = ""
         for y in range(sprite.height()):  # pylint: disable=invalid-name
             color_string += "{"
@@ -169,13 +197,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
                     )
                     and self.original_icon[x, y][3] == 255
                 ):
-                    bulb_color = (
-                        bulb_color[0],
-                        bulb_color[1],
-                        bulb_color[2],
-                        bulb_color[3],
-                    )
-                    color = utils.hsbk_to_rgb(bulb_color)
+                    color = rendered_color
                 elif (
                     all(
                         v
@@ -193,7 +215,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
                 color_string += utils.tuple2hex(color) + " "
             color_string += "} "
         # Write the final colorstring to the sprite, then update the GUI
-        sprite.put(color_string, (0, 0, sprite.height(), sprite.width()))
+        sprite.put(color_string, (0, 0, sprite.width(), sprite.height()))
         self.canvas.itemconfig(image, image=sprite)
 
     def set_selected_bulb(self, light_name):
@@ -215,7 +237,7 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
                     color = icon_rgb
                 color_string += utils.tuple2hex(color) + " "
             color_string += "} "
-        sprite.put(color_string, (0, 0, sprite.height(), sprite.width()))
+        sprite.put(color_string, (0, 0, sprite.width(), sprite.height()))
         self.canvas.itemconfig(image, image=sprite)
         self._current_icon = light_name
 
@@ -236,6 +258,6 @@ class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attribut
                     color = icon_rgb
                 color_string += utils.tuple2hex(color) + " "
             color_string += "} "
-        sprite.put(color_string, (0, 0, sprite.height(), sprite.width()))
+        sprite.put(color_string, (0, 0, sprite.width(), sprite.height()))
         self.canvas.itemconfig(image, image=sprite)
         self._current_icon = None

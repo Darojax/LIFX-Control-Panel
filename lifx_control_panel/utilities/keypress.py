@@ -17,18 +17,23 @@ class KeybindManager:
         self.keys_held = set()
         self.sticky = sticky
         self.hooks = {}
-        keyboard.on_press(lambda e: self.keys_held.add(e.name))
-        keyboard.on_release(lambda e: self.keys_held.discard(e.name))
+        self._active_hooks = {}
+        self._key_hooks = []
+        self._running = False
+        self.restart()
 
     @property
     def key_combo_code(self) -> str:
         """Converts the keys currently being held into a string representing the combination"""
-        return "+".join(self.keys_held)
+        return "+".join(sorted(self.keys_held))
 
     def register_function(self, key_combo, function):
         """Register function callback to key_combo"""
-        cb = keyboard.add_hotkey(key_combo, function)
-        self.hooks[key_combo] = cb
+        keyboard.parse_hotkey(key_combo)
+        self.unregister_function(key_combo)
+        if self._running:
+            self._active_hooks[key_combo] = keyboard.add_hotkey(key_combo, function)
+        self.hooks[key_combo] = function
         self.logger.info(
             "Registered function <%s> to keycombo <%s>.",
             function.__name__,
@@ -37,7 +42,10 @@ class KeybindManager:
 
     def unregister_function(self, key_combo):
         """Stop tracking function at key_combo"""
-        keyboard.remove_hotkey(key_combo)
+        handle = self._active_hooks.pop(key_combo, None)
+        if handle is not None:
+            keyboard.remove_hotkey(handle)
+        self.hooks.pop(key_combo, None)
         self.logger.info(
             "Unregistered function at keycombo <%s>",
             key_combo.lower(),
@@ -57,11 +65,23 @@ class KeybindManager:
             self.keys_held.discard(event.name)
 
     def shutdown(self):
-        """Stop following keyboard events."""
-        keyboard.unhook_all()
+        """Suspend only this manager's hooks, retaining the original callbacks."""
+        self._running = False
+        for handle in self._active_hooks.values():
+            keyboard.remove_hotkey(handle)
+        self._active_hooks.clear()
+        for handle in self._key_hooks:
+            keyboard.unhook(handle)
+        self._key_hooks.clear()
+        self.keys_held.clear()
 
     def restart(self):
-        """Clear keys held and rehook keyboard."""
-        self.keys_held = set()
-        for keycombo, cb in self.hooks.items():
-            keyboard.register_hotkey(keycombo, cb)
+        """Restore callbacks rather than registering their old removal functions."""
+        self.shutdown()
+        self._running = True
+        self._key_hooks = [
+            keyboard.on_press(self._on_key_down),
+            keyboard.on_release(self._on_key_up),
+        ]
+        for keycombo, callback in self.hooks.items():
+            self._active_hooks[keycombo] = keyboard.add_hotkey(keycombo, callback)

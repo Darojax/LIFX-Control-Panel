@@ -1,13 +1,15 @@
 import unittest
 
-from test.dummy_devices import *
-from utilities.utils import Color
+from lifx_control_panel.test.dummy_devices import *
+from lifx_control_panel.utilities.utils import Color
 
 
 class TestLAN(unittest.TestCase):
     def setUp(self):
         self.lifx = LifxLANDummy()
         self.light_labels = ["Bedroom Lamp", "Patio-Lights", "Andy's Room"]
+        for label in self.light_labels:
+            self.lifx.add_dummy_light(DummyBulb(label=label))
 
     def test_add_lights(self):
         for label in self.light_labels:

@@ -1,0 +1,137 @@
+# Change record: stability, device controls, and Cinema Sync
+
+Base commit: `ac245dd`. Recorded on 2026-11-03.
+
+- Restore themed effect-button backgrounds when effects stop.
+- Keep preset labels readable against their selected colours.
+- Disable empty custom-preset menus.
+- Prevent Windows screen capture from flickering the mouse cursor.
+- Make continuous effects exclusive within each light panel.
+- Stop competing effects on overlapping groups and individual lights.
+- Discard stale effect calculations after stopping or switching effects.
+- Preserve independent colour-slider variables for each light panel.
+- Prevent duplicate polling timers when reopening light panels.
+- Keep only the latest queued device state for the interface.
+- Prevent slow device queries from accumulating polling batches.
+- Give each rescan its own polling cancellation event.
+- Read device state concurrently with a bounded worker pool during discovery.
+- Reuse prefetched device state when constructing light panels.
+- Build groups from discovered devices without repeating LAN discovery.
+- Retry transient discovery and device-state failures.
+- Bound Windows UDP reset handling by the original receive timeout.
+- Recover multizone devices incorrectly classified as ordinary lights.
+- Skip unreachable devices without closing the application.
+- Register clickable device icons only after their panels are built.
+- Preserve the working interface after failed network discovery.
+- Tolerate missing icon-cache entries after rescanning.
+- Limit continuous effects to twenty updates per second.
+- Coalesce slider drags while retaining the final colour value.
+- Cancel pending slider writes when another control takes over.
+- Reuse screen-capture resources within each effect worker.
+- Avoid large colour-histogram allocations during dominant-colour capture.
+- Support dominant-colour sampling from very small screen regions.
+- Apply edited screen regions when restarting screen-following effects.
+- Reject invalid screen-capture dimensions before starting effects.
+- Add screen-following brightness caps and dark-scene cutoffs.
+- Add an adjustable near-black colour-noise filter.
+- Keep screen-following brightness limits separate from other effects.
+- Restore original keyboard-shortcut callbacks after closing Settings.
+- Remove only keyboard hooks owned by the application.
+- Prevent deleted keyboard shortcuts from returning after Settings closes.
+- Dispatch tray and shortcut callbacks through the Tk event queue.
+- Stop competing effects before applying keyboard colour shortcuts.
+- Allow Settings to open when no lights are discovered.
+- Validate shortcut selections before registering them.
+- Store portable settings beside the executable using atomic file replacement.
+- Keep application logs beside the executable.
+- Close the previous audio stream when switching inputs.
+- Support mono audio inputs and exclude output-only devices.
+- Drain buffered audio to keep music effects current.
+- Allow startup without the optional PyAudio dependency.
+- Close effects, keyboard hooks, audio streams and the tray icon on shutdown.
+- Make eyedropper selection cancellable without background Tk calls.
+- Preserve slider positions when their widgets are resized.
+- Correct colour-scale reads for nonzero minimum values.
+- Package only the intended entry point in each executable.
+- Make the demo use simulated devices without discovering real lights.
+- Repair test imports and populate meaningful dummy-device fixtures.
+- Add regressions for effect cancellation, discovery, settings and lifecycle behaviour.
+- Rebuild all executable variants in the existing distribution folder.
+
+- Serialize writes to each physical light across effects and background actions.
+- Invalidate superseded queued actions when another control takes over.
+- Add manual saving of light states keyed by MAC address.
+- Restore saved colours and power after light labels change.
+- Save and restore individual multizone colours.
+- Add opt-in restoration of saved lights on application startup.
+- Add opt-in Windows startup registration using native shortcuts.
+- Add individual and all-light power controls to the tray menu.
+- Add power-toggle and brightness-adjustment keyboard shortcuts.
+- Turn mixed-power groups off together when toggling group power.
+- Add validated numeric entry for hue, saturation, brightness and Kelvin.
+- Preserve typed colour values while their entry has focus.
+- Add multizone painting that commits colours on mouse release.
+- Keep multizone sliders as a paint palette instead of repainting the strip.
+- Add explicit zone refresh without repeatedly polling every zone.
+- Batch extended-zone writes into packets of up to eighty-two colours.
+- Split extended writes across multiple packets for longer strips.
+- Coalesce equal neighbouring colours in legacy zone writes.
+- Retry lost zone acknowledgements without reporting recovered attempts as failures.
+- Cancel remaining zone retries after a newer action takes over.
+- Avoid guessing extended-zone support when firmware detection fails.
+- Verify multizone packet layout and inclusive legacy zone ranges.
+- Scale custom icons and colour controls for high-resolution displays.
+- Wrap complete device names instead of truncating them to eight characters.
+- Expand icon rows to contain the full wrapped device label.
+- Avoid repeated colour conversions while rendering scaled bulb icons.
+- Replace audioop with portable sixteen-bit PCM RMS calculation.
+- Replace deprecated Tk variable traces with trace_add callbacks.
+- Use the native Python thread-exception hook.
+- Make PyAudio an optional package extra.
+- Remove the unused numexpr dependency.
+- Pin the screen-capture version used by the cursor-flicker workaround.
+- Add a Windows CI test matrix for Python 3.12 and Python 3.14.
+- Update CI actions and remove obsolete SWIG installation steps.
+- Build executables with the supported PyInstaller 6 workflow.
+- Preserve all queued light updates during overlapping-group batch actions.
+- Skip network reads for superseded queued group shortcuts.
+- Normalize initial and polled colour values before comparing cached device states.
+- Add end-to-end saved-state and tray-action regression checks.
+- Exercise startup shortcuts in a temporary folder without changing Windows startup.
+- Add an exclusive Cinema Sync effect for dynamic movie lighting on a room lamp.
+- Blend supported illuminated colours without averaging opposing colours to grey.
+- Combine scene exposure and highlight area to reflect bright action without normalizing dark scenes.
+- Discount paired black bars and conservatively filter thin white subtitle-shaped regions.
+- Follow abrupt colour changes quickly and provide adjustable brightness attack and decay.
+- Preserve the previous colour while fading to black and prevent brightness offsets from keeping black scenes lit.
+- Add Impact, Response, and Decay controls with defaults of 80 percent, 90 percent, and 180 milliseconds.
+- Apply existing screen brightness caps and cutoffs to Cinema Sync while retaining the selected Kelvin value.
+- Reset Cinema Sync analysis history on every start.
+- Limit Cinema Sync analysis to a small frame and reuse the existing cursor-friendly capture worker.
+- Rename the shared capture area to Screen Region for all screen lighting modes.
+- Add synthetic movie-scene, effect switching, worker restart, and Cinema Sync settings regressions.
+- Document Cinema Sync tuning and the remaining live movie and HDR qualification limits.
+- Smooth Cinema Sync colour and brightness updates with short response-dependent lamp transitions.
+- Add an overall Cinema Sync brightness slider that scales output after screen brightness limits.
+- Apply saved Cinema Sync brightness changes to running effects without restarting them.
+- Cover interpolated transitions and brightness scaling with simulated-device regressions.
+- Preview all four Cinema Sync sliders live while the Settings window remains open.
+- Keep live previews separate from saved configuration until OK is pressed.
+- Restore saved Cinema Sync settings when preview changes are cancelled or the window closes.
+- Verify live slider updates reach the existing effect worker without restarting capture.
+- Reduce the sustained brightness of small highlights in otherwise dark scenes.
+- Reserve strong highlight boosts for sudden increases in illumination and pronounced colour changes.
+- Avoid retriggering highlight impacts when a steady light source moves across the screen.
+- Add sustained-headlight, moving-headlight, white-strobe, and localized police-light regressions.
+- Rename the effect to Cinema Sync while preserving existing slider settings.
+- Replace abrupt dominant-colour handoffs with progressive hue and saturation blending.
+- Keep transitions smooth through balanced and nearly complementary colour mixtures.
+- Base fast colour response on screen changes instead of the distance between output hues.
+- Add gradual blue-to-red, white-reveal, and multicolour transition regressions.
+- Remove the live-preview explanatory line from the Settings window.
+- Poll a strip's representative colour without repeatedly downloading its full zone palette.
+- Remove unused imports and obsolete demo logging setup.
+- Declare the Windows runtime dependency in package metadata and remove an obsolete platform classifier.
+- Refresh the feature overview, audio installation instructions, and Cinema Sync control documentation.
+- Remove superseded build and test scratch logs while retaining the current build receipt.
+- Pin the formatting hook to the verified Black release instead of a mutable reference.

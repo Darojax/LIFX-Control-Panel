@@ -37,6 +37,8 @@ class ColorScale(tk.Canvas):
             * gradient: The type of background coloration
             * **kwargs: Any other keyword argument accepted by a tkinter Canvas
         """
+        scale = max(0.75, parent.winfo_fpixels("1i") / 96)
+        width, height = max(1, round(width * scale)), max(1, round(height * scale))
         tk.Canvas.__init__(self, parent, width=width, height=height, **kwargs)
         self.parent = parent
         self.max = to
@@ -55,11 +57,11 @@ class ColorScale(tk.Canvas):
             self._variable = tk.IntVar(self)
         val = max(min(self.max, val), self.min)
         self._variable.set(val)
-        self._variable.trace("w", self._update_val)
+        self._variable.trace_add("write", self._update_val)
 
         self.gradient = tk.PhotoImage(master=self, width=int(width), height=int(height))
 
-        self.bind("<Configure>", lambda _: self._draw_gradient(val))
+        self.bind("<Configure>", lambda _: self._draw_gradient(self._variable.get()))
         self.bind("<ButtonPress-1>", self._on_click)
         # self.bind('<ButtonRelease-1>', self._on_release)
         self.bind("<B1-Motion>", self._on_move)
@@ -134,6 +136,9 @@ class ColorScale(tk.Canvas):
 
     def update_slider_value(self, width, x_coord):
         """Update the slider value based on slider x coordinate."""
+        if width <= 0:
+            return
+        x_coord = min(max(x_coord, 0), width)
         height = self.winfo_height()
         for x_start in self.find_withtag("cursor"):
             self.coords(x_start, x_coord, 0, x_coord, height)
@@ -159,7 +164,7 @@ class ColorScale(tk.Canvas):
         """Return val of color under cursor."""
         coords = self.coords("cursor")
         width = self.winfo_width()
-        return round(self.range * coords[0] / width, 2)
+        return round(self.range * coords[0] / width + self.min, 2)
 
     def set(self, val):
         """Set cursor position on the color corresponding to the value"""

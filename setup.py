@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 from lifx_control_panel._constants import VERSION
 
-with open("README.md", "r") as f:
+with open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
 
 setup(
@@ -21,15 +21,16 @@ setup(
     install_requires=[
         "keyboard",
         "mouse",
-        "pyaudio",
         "Pillow",
         "lifxlan",
         "bitstring<4",
-        "numexpr",
         "numpy",
-        "mss",
+        "mss==10.1.0",
         "pystray",
+        "pywin32; sys_platform == 'win32'",
     ],
+    extras_require={"audio": ["pyaudio"]},
+    python_requires=">=3.12",
     download_url=(
         ("https://github.com/Darojax/LIFX-Control-Panel/archive/" + str(VERSION))
         + ".tar.gz"
@@ -46,14 +47,11 @@ setup(
         "Intended Audience :: End Users/Desktop",
         "Natural Language :: English",
         "Operating System :: Microsoft :: Windows :: Windows 10",
-        "Operating System :: Microsoft :: Windows :: Windows 8.1",
-        "Operating System :: Microsoft :: Windows :: Windows 8",
-        "Operating System :: Microsoft :: Windows :: Windows 7",
         "Topic :: Home Automation",
         # Pick your license as you wish (should match "license" above)
         "License :: OSI Approved :: MIT License",
         # Specify the Python versions you support here. In particular, ensure
         # that you indicate whether you support Python 2, Python 3 or both.
-        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.12",
     ],
 )

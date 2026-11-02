@@ -11,7 +11,11 @@ Notes
 
 import configparser
 import logging
+import os
 import queue
+import sys
+import tempfile
+from pathlib import Path
 import threading
 from tkinter import ttk
 from tkinter import (
@@ -32,19 +36,25 @@ from tkinter import (
     Y,
     END,
     BooleanVar,
+    DoubleVar,
     Checkbutton,
     StringVar,
     OptionMenu,
     Scale,
     HORIZONTAL,
     Entry,
+    messagebox,
 )
 from tkinter.colorchooser import askcolor
 
 import mss
 from lifxlan.utils import RGBtoHSBK
+from lifxlan import WHITE
+from .. import RED
 
 from ..utilities.keypress import KeybindManager
+from ..utilities.device_actions import KEYBIND_ACTIONS
+from ..utilities.desktop import get_launch_on_startup, set_launch_on_startup
 from ..utilities.utils import resource_path, str2list
 from .theme import (
     THEME_LABEL_TO_VALUE,
@@ -55,12 +65,53 @@ from .theme import (
     theme_value_from_label,
 )
 
-config = configparser.ConfigParser()  # pylint: disable=invalid-name
-config.read([resource_path("default.ini"), "config.ini"])
+CONFIG_PATH = (
+    Path(sys.executable).parent / "config.ini"
+    if getattr(sys, "frozen", False)
+    else Path(resource_path("default.ini")).parent / "config.ini"
+)
+config = configparser.ConfigParser(interpolation=None)  # pylint: disable=invalid-name
+# Preserve legacy settings on the first portable run, then save beside the exe.
+legacy_config = Path.cwd() / "config.ini"
+config.read(
+    [
+        resource_path("default.ini"),
+        str(legacy_config if not CONFIG_PATH.exists() else CONFIG_PATH),
+        str(CONFIG_PATH),
+    ]
+)
 if not config.has_section("AppSettings"):
     config.add_section("AppSettings")
 if not config.has_option("AppSettings", "theme"):
     config["AppSettings"]["theme"] = "system"
+
+# Replace this snapshot on the GUI thread; effect workers only read plain values.
+# Keeping it separate from config prevents unrelated saves from committing a
+# temporary slider preview. The token prevents an older dialog clearing a new one.
+_action_sync_preview = None
+
+
+def get_action_sync_value(option, fallback):
+    """Read a live preview value, or the saved setting when no preview is active."""
+    preview = _action_sync_preview
+    if preview is not None and option in preview[1]:
+        return preview[1][option]
+    return config.getfloat("ActionSync", option, fallback=fallback)
+
+
+def save_config():
+    """Replace the portable settings file atomically to avoid partial writes."""
+    descriptor, temporary = tempfile.mkstemp(
+        dir=CONFIG_PATH.parent, prefix="config-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            config.write(output)
+        os.replace(temporary, CONFIG_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
 
 # Compare datetimes
 DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
@@ -288,6 +339,9 @@ class SettingsDisplay(Dialog):
         self.key_listener = None
         self._key_capture_after_id = None
         self._monitor_options_queue = queue.Queue(maxsize=1)
+        self._action_preview_token = object()
+        self._action_preview_closed = False
+        self.bind("<Destroy>", self._end_action_preview, add="+")
         # Labels
         Label(master, text="Start Minimized?: ").grid(row=0, column=0, sticky="w")
         Label(master, text="Theme: ").grid(row=1, column=0, sticky="w")
@@ -362,9 +416,11 @@ class SettingsDisplay(Dialog):
 
         # Add keybindings
         light_names = list(self.root_window.device_map.keys())
-        self.keybind_bulb_selection = StringVar(master, value=light_names[0])
+        self.keybind_bulb_selection = StringVar(
+            master, value=light_names[0] if light_names else "No lights found"
+        )
         self.keybind_bulb_dropdown = OptionMenu(
-            master, self.keybind_bulb_selection, *light_names
+            master, self.keybind_bulb_selection, *(light_names or ["No lights found"])
         )
         self.keybind_keys_select = Entry(master)
         self.keybind_keys_select.insert(END, "Add key-combo...")
@@ -372,12 +428,15 @@ class SettingsDisplay(Dialog):
         self.keybind_keys_select.bind("<FocusIn>", self.on_keybind_keys_click)
         self.keybind_keys_select.bind("<FocusOut>", self.on_keybind_keys_focus_out)
         self.keybind_color_selection = StringVar(master, value="Color")
+        first_frame = next(iter(self.root_window.frame_map.values()), None)
+        self._default_colors = (
+            first_frame.default_colors if first_frame else {"RED": RED, "WHITE": WHITE}
+        )
         self.keybind_color_dropdown = OptionMenu(
             master,
             self.keybind_color_selection,
-            *self.root_window.frame_map[
-                self.keybind_bulb_selection.get()
-            ].default_colors,
+            *KEYBIND_ACTIONS,
+            *self._default_colors,
             *(
                 [*config["PresetColors"].keys()]
                 if any(config["PresetColors"].keys())
@@ -396,6 +455,8 @@ class SettingsDisplay(Dialog):
         self.keybind_delete_button = Button(
             master, text="Delete keybind", command=self.delete_keybind
         )
+        if not light_names:
+            self.keybind_add_button.config(state="disabled")
 
         # Insert
         self.start_mini_check.grid(row=0, column=1, sticky="w")
@@ -424,14 +485,154 @@ class SettingsDisplay(Dialog):
         self.keybind_add_button.grid(row=7, column=4)
         self.mlb = MultiListbox(master, (("Bulb", 5), ("Keybind", 5), ("Color", 5)))
         for keypress, fnx in dict(config["Keybinds"]).items():
-            label, color = fnx.split(":")
+            if ":" not in fnx:
+                continue
+            label, color = fnx.rsplit(":", 1)
             self.mlb.insert(END, (label, keypress, color))
         self.mlb.grid(row=8, columnspan=100, sticky="esw")
         self.keybind_delete_button.grid(row=9, column=0)
 
+        Label(master, text="Screen max brightness (%):").grid(
+            row=10, column=0, sticky="w"
+        )
+        Label(master, text="Screen dark cutoff (%):").grid(row=11, column=0, sticky="w")
+        Label(master, text="Near-black threshold (0–255):").grid(
+            row=12, column=0, sticky="w"
+        )
+        self.max_brightness = Scale(
+            master, from_=0, to_=100, resolution=0.1, orient=HORIZONTAL
+        )
+        self.max_brightness.set(
+            config.getint("AverageColor", "maxbrightness", fallback=65535) * 100 / 65535
+        )
+        self.min_brightness_cutoff = Scale(
+            master, from_=0, to_=100, resolution=0.1, orient=HORIZONTAL
+        )
+        self.min_brightness_cutoff.set(
+            config.getint("AverageColor", "minbrightnesscutoff", fallback=0)
+            * 100
+            / 65535
+        )
+        self.near_black_threshold = Scale(
+            master, from_=0, to_=255, resolution=1, orient=HORIZONTAL
+        )
+        self.near_black_threshold.set(
+            config.getint("AverageColor", "nearblackthreshold", fallback=10)
+        )
+        self.max_brightness.grid(row=10, column=1, sticky="w")
+        self.min_brightness_cutoff.grid(row=11, column=1, sticky="w")
+        self.near_black_threshold.grid(row=12, column=1, sticky="w")
+        Label(master, text="0 disables near-black filtering").grid(
+            row=12, column=2, columnspan=3, sticky="w"
+        )
+
+        self.launch_startup = BooleanVar(master, value=get_launch_on_startup())
+        self.restore_startup = BooleanVar(
+            master,
+            value=config.getboolean(
+                "AppSettings", "restore_state_on_startup", fallback=False
+            ),
+        )
+        Checkbutton(
+            master,
+            text="Launch with Windows",
+            variable=self.launch_startup,
+            state="normal" if sys.platform == "win32" else "disabled",
+        ).grid(row=13, column=0, sticky="w")
+        Checkbutton(
+            master,
+            text="Restore saved lights on startup",
+            variable=self.restore_startup,
+        ).grid(row=13, column=1, columnspan=3, sticky="w")
+
+        action_group = ttk.LabelFrame(
+            master, text="Cinema Sync (movie room light)", padding=4
+        )
+        action_group.grid(row=14, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+        self.action_controls = {}
+        self._action_variables = {}
+        for column, (key, label, minimum, maximum, default) in enumerate(
+            (
+                ("impact", "Impact (%)", 0, 100, 80),
+                ("response", "Response (%)", 0, 100, 90),
+                ("decay_ms", "Decay (ms)", 50, 1000, 180),
+                ("brightness", "Brightness (%)", 0, 100, 100),
+            )
+        ):
+            Label(action_group, text=label).grid(row=0, column=column, sticky="w")
+            variable = DoubleVar(
+                action_group, value=config.getfloat("ActionSync", key, fallback=default)
+            )
+            control = Scale(
+                action_group,
+                from_=minimum,
+                to_=maximum,
+                resolution=1,
+                orient=HORIZONTAL,
+                length=160,
+                variable=variable,
+            )
+            control.grid(row=1, column=column, sticky="w", padx=(0, 12))
+            self.action_controls[key] = control
+            self._action_variables[key] = variable
+        for variable in self._action_variables.values():
+            variable.trace_add("write", self._preview_action_sync)
         self.after_idle(self._load_monitor_options_async)
 
+    def _preview_action_sync(self, *_):
+        """Publish numeric values without exposing Tk variables to effect workers."""
+        if self._action_preview_closed:
+            return
+        global _action_sync_preview
+        _action_sync_preview = (
+            self._action_preview_token,
+            {key: variable.get() for key, variable in self._action_variables.items()},
+        )
+
+    def _end_action_preview(self, event=None):
+        """Drop unsaved overrides on Cancel, close, destruction, or successful OK."""
+        if event is not None and event.widget is not self:
+            return
+        global _action_sync_preview
+        if (
+            _action_sync_preview is not None
+            and _action_sync_preview[0] is self._action_preview_token
+        ):
+            _action_sync_preview = None
+        self._action_preview_closed = True
+
     def validate(self) -> int:
+        if self.min_brightness_cutoff.get() > self.max_brightness.get():
+            messagebox.showerror(
+                "Invalid screen brightness",
+                "The dark cutoff must not exceed maximum brightness.",
+                parent=self,
+            )
+            return 0
+        if self.launch_startup.get() != get_launch_on_startup():
+            try:
+                set_launch_on_startup(self.launch_startup.get())
+            except Exception as exc:
+                messagebox.showerror(
+                    "Unable to update Windows startup", str(exc), parent=self
+                )
+                return 0
+        config["AverageColor"]["maxbrightness"] = str(
+            round(self.max_brightness.get() * 65535 / 100)
+        )
+        config["AverageColor"]["minbrightnesscutoff"] = str(
+            round(self.min_brightness_cutoff.get() * 65535 / 100)
+        )
+        config["AverageColor"]["nearblackthreshold"] = str(
+            self.near_black_threshold.get()
+        )
+        if not config.has_section("ActionSync"):
+            config.add_section("ActionSync")
+        for key, control in self.action_controls.items():
+            config["ActionSync"][key] = str(control.get())
+        config["AppSettings"]["restore_state_on_startup"] = str(
+            self.restore_startup.get()
+        )
         config["AppSettings"]["start_minimized"] = str(self.start_mini.get())
         config["AppSettings"]["theme"] = theme_value_from_label(
             self.theme_selection.get()
@@ -444,8 +645,8 @@ class SettingsDisplay(Dialog):
             selected_audio, config.get("Audio", "InputIndex", fallback="0")
         )
         # Write to config file
-        with open("config.ini", "w", encoding="utf-8") as cfg:
-            config.write(cfg)
+        save_config()
+        self._end_action_preview()
 
         if hasattr(self.root_window, "apply_theme"):
             self.root_window.apply_theme(config["AppSettings"]["theme"])
@@ -455,6 +656,7 @@ class SettingsDisplay(Dialog):
         return 1
 
     def cancel(self, _=None):
+        self._end_action_preview()
         self._shutdown_settings_listener()
         return super().cancel(_)
 
@@ -501,13 +703,31 @@ class SettingsDisplay(Dialog):
 
     def register_keybinding(self, bulb: str, keys: str, color: str):
         """Get the keybind from the input box and pass the color off to the root window."""
+        if (
+            bulb not in self.root_window.frame_map
+            or not keys
+            or keys == "Add key-combo..."
+        ):
+            messagebox.showerror(
+                "Invalid shortcut",
+                "Select a light, key combination and colour.",
+                parent=self,
+            )
+            return
         try:
-            color = self.root_window.frame_map[
-                self.keybind_bulb_selection.get()
-            ].default_colors[color]
-        except KeyError:  # must be using a custom color
-            color = str2list(config["PresetColors"][color], int)
-        self.root_window.save_keybind(bulb, keys, color)
+            if color not in KEYBIND_ACTIONS:
+                color = (
+                    self._default_colors[color]
+                    if color in self._default_colors
+                    else str2list(config["PresetColors"][color], int)
+                )
+            self.root_window.save_keybind(bulb, keys, color)
+        except (KeyError, ValueError) as exc:
+            messagebox.showerror("Invalid shortcut", str(exc), parent=self)
+            return
+        for row in reversed(range(self.mlb.size())):
+            if self.mlb.get(row)[1] == keys:
+                self.mlb.delete(row)
         config["Keybinds"][str(keys)] = str(bulb + ":" + str(color))
         self.mlb.insert(END, (str(bulb), str(keys), str(color)))
         self.keybind_keys_select.config(state="normal")
@@ -559,7 +779,11 @@ class SettingsDisplay(Dialog):
 
     def delete_keybind(self):
         """Delete keybind currently selected in the multi-list box."""
-        _, keybind, _ = self.mlb.get(ACTIVE)
-        self.mlb.delete(ACTIVE)
+        selection = self.mlb.curselection()
+        if not selection:
+            return
+        row = selection[0]
+        _, keybind, _ = self.mlb.get(row)
+        self.mlb.delete(row)
         self.root_window.delete_keybind(keybind)
         config.remove_option("Keybinds", keybind)
