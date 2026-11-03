@@ -1,263 +1,198 @@
-from __future__ import annotations
-from dataclasses import dataclass, field
+"""Compact device lists with live colour indicators and overflow-only scrolling."""
 
 import tkinter
 from tkinter import ttk
-from typing import Dict, Union
-from PIL import Image as pImage
-from io import BytesIO
 
-import lifxlan
 from ..utilities import utils
 
 
-@dataclass
-class BulbIconListSettings:
-    """Encapsulates all constants for the bulb icon list"""
+class BulbIconList(tkinter.Frame):
+    """Device navigation; keep the selection/update API used by the main frame."""
 
-    window_width: int
-    icon_width: int
-    icon_height: int
-    icon_padding: int
-    highlight_saturation: int
-    color_code: dict[str, int] = field(default_factory=dict)
-
-    def __post_init__(self):
-        self.window_width = max(0, self.window_width)
-        self.icon_width = max(0, self.icon_width)
-        self.icon_height = max(0, self.icon_height)
-        self.icon_padding = max(0, self.icon_padding)
-        self.highlight_saturation = min(max(0, self.highlight_saturation), 255)
-
-
-class BulbIconList(tkinter.Frame):  # pylint: disable=too-many-instance-attributes
-    """Holds the dynamic icons for each Device and Group"""
-
-    def __init__(self, *args, is_group: bool = False, **kwargs):
-        # Parameters
+    def __init__(
+        self,
+        *args,
+        is_group=False,
+        owner=None,
+        compact=False,
+        show_heading=True,
+        **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.owner = owner or self.master
         self.is_group = is_group
-
-        # Constants
-        self.settings = BulbIconListSettings(
-            window_width=285,
-            icon_width=50,
-            icon_height=75,
-            icon_padding=5,
-            highlight_saturation=95,
-            color_code={"BULB_TOP": 11, "BACKGROUND": 15},
-        )
-
-        # Initialization
-        super().__init__(
-            *args,
-            width=self.settings.window_width,
-            height=self.settings.icon_height,
-            **kwargs,
-        )
+        self.compact = compact
         self.scale = max(0.75, self.winfo_fpixels("1i") / 96)
-        self.icon_base_height = round(75 * self.scale)
-        self.settings.window_width = round(self.settings.window_width * self.scale)
-        self.settings.icon_width = round(90 * self.scale)
-        self.settings.icon_height = round(105 * self.scale)
-        self.settings.icon_padding = max(
-            1, round(self.settings.icon_padding * self.scale)
-        )
-        self.scroll_x = 0
-        self.scroll_y = self.settings.icon_height
-        self.bulb_dict: dict[str, tuple[tkinter.PhotoImage, int, int]] = {}
+        self.bulb_dict = {}
+        self._current_icon = None
+        self.scroll_y = 0
+        self._overflow = False
+        self._palette = {
+            "field": "#ffffff",
+            "foreground": "#172333",
+            "selection": "#2563eb",
+            "selection_fg": "#ffffff",
+            "disabled": "#738095",
+            "accent": "#2563eb",
+        }
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+        if show_heading:
+            ttk.Label(
+                self, text="Groups" if is_group else "Lights", style="Section.TLabel"
+            ).grid(row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(6, 6))
         self.canvas = tkinter.Canvas(
             self,
-            width=self.settings.window_width,
-            height=self.settings.icon_height,
-            scrollregion=(0, 0, self.scroll_x, self.scroll_y),
+            width=round(204 * self.scale),
+            height=round(130 * self.scale),
+            highlightthickness=0,
+            borderwidth=0,
+            confine=True,
         )
-        h_scroll = ttk.Scrollbar(
-            self, orient=tkinter.HORIZONTAL, style="Horizontal.TScrollbar"
+        self.canvas.grid(row=1, column=0, sticky="nsew")
+        self.scrollbar = ttk.Scrollbar(
+            self, orient="vertical", command=self.canvas.yview
         )
-        h_scroll.pack(side=tkinter.BOTTOM, fill=tkinter.X)
-        h_scroll.config(command=self.canvas.xview)
-        self.canvas.config(
-            width=self.settings.window_width, height=self.settings.icon_height
-        )
-        self.canvas.config(xscrollcommand=h_scroll.set)
-        self.canvas.pack(side=tkinter.LEFT, expand=True, fill=tkinter.BOTH)
-        self.current_icon_width = 0
-        path = self.icon_path()
-        with pImage.open(path) as image:
-            self._icon_source = image.resize(
-                (
-                    max(1, round(image.width * self.scale)),
-                    max(1, round(image.height * self.scale)),
-                ),
-                pImage.Resampling.NEAREST,
-            )
-        self.original_icon = self._icon_source.load()
-        self._current_icon = None
+        self.canvas.configure(yscrollcommand=self._scroll_changed)
+        self.canvas.bind("<Configure>", self._layout_rows)
+        self.canvas.bind("<MouseWheel>", self._mousewheel)
+        self.canvas.bind("<Button-4>", lambda event: self._wheel_units(-1))
+        self.canvas.bind("<Button-5>", lambda event: self._wheel_units(1))
 
     @property
     def current_icon(self):
-        """Returns the name of the currently selected Device/Group"""
         return self._current_icon
 
-    def icon_path(self):
-        """Returns the correct icon path for single Device or Group"""
-        return (
-            utils.resource_path("res/group.png")
-            if self.is_group
-            else utils.resource_path("res/lightbulb.png")
-        )
-
-    @property
-    def icon_paths(self) -> Dict[type, Union[int, bytes]]:
-        """Returns a dictionary of the icon paths for each device type"""
-        return {
-            lifxlan.Group: utils.resource_path("res/group.png"),
-            lifxlan.Light: utils.resource_path("res/lightbulb.png"),
-            lifxlan.MultiZoneLight: utils.resource_path("res/multizone.png"),
-        }
-
     def draw_bulb_icon(self, bulb, label):
-        """Given a bulb and a name, add the icon to the end of the row."""
-        # Make room on canvas
-        self.scroll_x += self.settings.icon_width
-        self.canvas.configure(scrollregion=(0, 0, self.scroll_x, self.scroll_y))
-        # Build icon
-        buffer = BytesIO()
-        self._icon_source.save(buffer, format="PNG")
-        sprite = tkinter.PhotoImage(data=buffer.getvalue(), master=self.master)
-        image = self.canvas.create_image(
-            (
-                self.current_icon_width
-                + self.settings.icon_width
-                - self.settings.icon_padding,
-                self.icon_base_height / 2 + 2 * self.settings.icon_padding,
-            ),
-            image=sprite,
-            anchor=tkinter.SE,
-            tags=[label],
+        background = self.canvas.create_rectangle(
+            0, 0, 1, 1, outline="", tags=(label, "row")
+        )
+        indicator = self.canvas.create_oval(
+            0, 0, 1, 1, outline="", tags=(label, "indicator")
         )
         text = self.canvas.create_text(
-            self.current_icon_width + self.settings.icon_width / 2,
-            self.icon_base_height / 2 + 2 * self.settings.icon_padding,
-            text=label,
-            width=self.settings.icon_width - 2 * self.settings.icon_padding,
-            justify=tkinter.CENTER,
-            fill=self._get_contrasting_text_color(),
-            anchor=tkinter.N,
-            tags=[label],
+            0, 0, text=label, anchor="w", tags=(label, "name")
         )
-        self.canvas.update_idletasks()
-        bounds = self.canvas.bbox(text)
-        if bounds:
-            self.scroll_y = max(self.scroll_y, bounds[3] + self.settings.icon_padding)
-            self.canvas.configure(
-                height=self.scroll_y, scrollregion=(0, 0, self.scroll_x, self.scroll_y)
-            )
-        self.bulb_dict[label] = (sprite, image, text)
+        self.bulb_dict[label] = (indicator, background, text)
+        self._layout_rows()
         self.update_icon(bulb)
-        # update sizing info
-        self.current_icon_width += self.settings.icon_width
+        self.apply_palette(self._palette)
 
-    def _get_contrasting_text_color(self):
-        """Return readable text color based on current canvas background."""
-        bg = self.canvas.cget("bg")
-        red, green, blue = [value // 256 for value in self.winfo_rgb(bg)]
-        luminance = 0.299 * red + 0.587 * green + 0.114 * blue
-        return "#111111" if luminance > 145 else "#f1f5f9"
+    def _layout_rows(self, event=None):
+        width = max(1, self.canvas.winfo_width())
+        if width <= 1:
+            width = self.canvas.winfo_pixels(self.canvas.cget("width"))
+        padding = round(10 * self.scale)
+        text_left = round(38 * self.scale)
+        top = 0
+        for indicator, background, text in self.bulb_dict.values():
+            self.canvas.itemconfigure(text, width=max(20, width - text_left - padding))
+            self.canvas.coords(text, text_left, top + padding)
+            bounds = self.canvas.bbox(text)
+            height = max(
+                round(44 * self.scale),
+                (bounds[3] - bounds[1] if bounds else 16) + 2 * padding,
+            )
+            self.canvas.coords(background, 0, top + 1, width, top + height - 1)
+            middle = top + height / 2
+            radius = round(7 * self.scale)
+            self.canvas.coords(
+                indicator,
+                padding,
+                middle - radius,
+                padding + 2 * radius,
+                middle + radius,
+            )
+            self.canvas.coords(text, text_left, middle)
+            top += height
+        self.scroll_y = top
+        if self.is_group or self.compact:
+            self.canvas.configure(
+                height=min(
+                    max(top, round(44 * self.scale)),
+                    round((88 if self.compact else 130) * self.scale),
+                )
+            )
+        viewport = max(1, self.canvas.winfo_height())
+        self.canvas.configure(scrollregion=(0, 0, width, max(top, viewport)))
+        self._set_overflow(top > viewport + 1)
 
-    def update_icon(self, bulb: lifxlan.Device):
-        """If changes have been detected in the interface, update the bulb state."""
-        if self.is_group:
+    def _set_overflow(self, overflow):
+        self._overflow = overflow
+        if overflow:
+            self.scrollbar.grid(row=1, column=1, sticky="ns")
+        else:
+            self.scrollbar.grid_remove()
+            if self.canvas.yview()[0] != 0:
+                self.canvas.yview_moveto(0)
+
+    def _scroll_changed(self, first, last):
+        self.scrollbar.set(first, last)
+
+    def _wheel_units(self, units):
+        if self._overflow:
+            self.canvas.yview_scroll(units, "units")
+        return "break"
+
+    def _mousewheel(self, event):
+        return self._wheel_units(
+            -int(event.delta / 120)
+            if abs(event.delta) >= 120
+            else (-1 if event.delta > 0 else 1)
+        )
+
+    def apply_palette(self, palette):
+        self._palette = palette
+        self.canvas.configure(bg=palette["field"])
+        for label, (indicator, background, text) in self.bulb_dict.items():
+            selected = label == self._current_icon
+            self.canvas.itemconfigure(
+                background, fill=palette["selection"] if selected else palette["field"]
+            )
+            self.canvas.itemconfigure(
+                text,
+                fill=palette["selection_fg"] if selected else palette["foreground"],
+            )
+            if self.is_group:
+                self.canvas.itemconfigure(
+                    indicator,
+                    fill=palette["selection_fg"] if selected else palette["accent"],
+                )
+
+    def update_icon(self, bulb):
+        if self.is_group or bulb is None:
             return
         try:
-            # this is ugly, but only way to update icon accurately
-            bulb_color = self.master.bulb_interface.color_cache[bulb.label]
-            bulb_power = self.master.bulb_interface.power_cache[bulb.label]
-            bulb_brightness = bulb_color[2]
-            sprite, image, _ = self.bulb_dict[bulb.label]
-        except (TypeError, KeyError):
-            # First run will give us None; Is immediately corrected on next pass
-            return
-        # Calculate what number, 0-11, corresponds to current brightness
-        brightness_scale = (int((bulb_brightness / 65535) * 10) * (bulb_power > 0)) - 1
-        rendered_color = utils.hsbk_to_rgb(bulb_color)
-        color_string = ""
-        for y in range(sprite.height()):  # pylint: disable=invalid-name
-            color_string += "{"
-            for x in range(sprite.width()):  # pylint: disable=invalid-name
-                # If the tick is < brightness, color it. Otherwise, set it back to the default color
-                icon_rgb = self.original_icon[x, y][:3]
-                if (
-                    all(
-                        (
-                            v <= brightness_scale
-                            or v == self.settings.color_code["BULB_TOP"]
-                        )
-                        for v in icon_rgb
-                    )
-                    and self.original_icon[x, y][3] == 255
-                ):
-                    color = rendered_color
-                elif (
-                    all(
-                        v
-                        in (
-                            self.settings.color_code["BACKGROUND"],
-                            self.settings.highlight_saturation,
-                        )
-                        for v in icon_rgb
-                    )
-                    and self.original_icon[x, y][3] == 255
-                ):
-                    color = sprite.get(x, y)[:3]
-                else:
-                    color = icon_rgb
-                color_string += utils.tuple2hex(color) + " "
-            color_string += "} "
-        # Write the final colorstring to the sprite, then update the GUI
-        sprite.put(color_string, (0, 0, sprite.width(), sprite.height()))
-        self.canvas.itemconfig(image, image=sprite)
+            colour = self.owner.bulb_interface.color_cache[bulb.label]
+            power = self.owner.bulb_interface.power_cache[bulb.label]
+            indicator = self.bulb_dict[bulb.label][0]
+            self.canvas.itemconfigure(
+                indicator,
+                fill=(
+                    utils.tuple2hex(utils.hsbk_to_rgb(colour))
+                    if power
+                    else self._palette["disabled"]
+                ),
+            )
+        except (AttributeError, TypeError, KeyError):
+            pass
 
     def set_selected_bulb(self, light_name):
-        """Highlight the newly selected bulb icon when changed."""
-        if self._current_icon:
-            self.clear_selected()
-        sprite, image, _ = self.bulb_dict[light_name]
-        color_string = ""
-        for y in range(sprite.height()):  # pylint: disable=invalid-name
-            color_string += "{"
-            for x in range(sprite.width()):  # pylint: disable=invalid-name
-                icon_rgb = sprite.get(x, y)[:3]
-                if (
-                    all(v == self.settings.color_code["BACKGROUND"] for v in icon_rgb)
-                    and self.original_icon[x, y][3] == 255
-                ):
-                    color = (self.settings.highlight_saturation,) * 3
-                else:
-                    color = icon_rgb
-                color_string += utils.tuple2hex(color) + " "
-            color_string += "} "
-        sprite.put(color_string, (0, 0, sprite.width(), sprite.height()))
-        self.canvas.itemconfig(image, image=sprite)
-        self._current_icon = light_name
+        if light_name in self.bulb_dict:
+            self._current_icon = light_name
+            self.apply_palette(self._palette)
+            _, background, _ = self.bulb_dict[light_name]
+            bounds = self.canvas.coords(background)
+            if self._overflow and bounds:
+                first = self.canvas.canvasy(0)
+                last = first + self.canvas.winfo_height()
+                if bounds[1] < first:
+                    self.canvas.yview_moveto(bounds[1] / self.scroll_y)
+                elif bounds[3] > last:
+                    self.canvas.yview_moveto(
+                        (bounds[3] - self.canvas.winfo_height()) / self.scroll_y
+                    )
 
     def clear_selected(self):
-        """Reset background to original state (from highlighted)."""
-        sprite, image, _ = self.bulb_dict[self._current_icon]
-        color_string = ""
-        for y in range(sprite.height()):  # pylint: disable=invalid-name
-            color_string += "{"
-            for x in range(sprite.width()):  # pylint: disable=invalid-name
-                icon_rgb = sprite.get(x, y)[:3]
-                if (
-                    all(v == self.settings.highlight_saturation for v in icon_rgb)
-                    and self.original_icon[x, y][3] == 255
-                ):
-                    color = (self.settings.color_code["BACKGROUND"],) * 3
-                else:
-                    color = icon_rgb
-                color_string += utils.tuple2hex(color) + " "
-            color_string += "} "
-        sprite.put(color_string, (0, 0, sprite.width(), sprite.height()))
-        self.canvas.itemconfig(image, image=sprite)
         self._current_icon = None
+        self.apply_palette(self._palette)

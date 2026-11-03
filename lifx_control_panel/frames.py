@@ -2,7 +2,7 @@ import logging
 import queue
 import math
 import tkinter
-from tkinter import ttk, font as font, messagebox, _setit
+from tkinter import ttk, messagebox, _setit
 from typing import Union, Tuple, Dict, Mapping
 
 import mouse
@@ -83,18 +83,13 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
     ):
         super().__init__(
             master,
-            padding="3 3 12 12",
-            labelwidget=tkinter.Label(
-                master,
-                text="<LABEL_ERR>",
-                font=font.Font(size=12),
-                fg="#0046d5",
-                relief=tkinter.RIDGE,
-            ),
+            padding=6,
         )
         self._initial_state = initial_state
         self._color_send_job = None
+        self._poll_after_id = None
         self._pending_color = None
+        self.bind("<Destroy>", self._dispose_frame, add="+")
         self.icon_update_flag: bool = True
         # Initialize LightFrames
         bulb_power, init_color = self._get_light_info(target)
@@ -104,14 +99,15 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             labelwidget=tkinter.Label(
                 master,
                 text=self.label,
-                font=font.Font(size=12),
+                font="TkHeadingFont",
+                wraplength=round(250 * max(0.75, self.winfo_fpixels("1i") / 96)),
+                justify="left",
                 fg="#0046d5",
-                relief=tkinter.RIDGE,
+                relief=tkinter.FLAT,
             )
         )
-        self.grid(column=1, row=0, sticky=(tkinter.N, tkinter.W, tkinter.E, tkinter.S))
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        self.grid(column=0, row=2, sticky=(tkinter.N, tkinter.W, tkinter.E, tkinter.S))
+        self.columnconfigure(1, weight=1)
         self.target = target
 
         # Setup logger
@@ -128,7 +124,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
         # Add buttons for special routines
         self.special_functions_lf = ttk.LabelFrame(
-            self, text="Special Functions", padding="3 3 12 12"
+            self, text="Effects & tools", padding=6
         )
         ####
 
@@ -155,10 +151,20 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         self.max_kelvin = state.features.get("max_kelvin") or MAX_KELVIN_DEFAULT
         return state.power, Color(*state.color)
 
+    def _dispose_frame(self, event):
+        if event.widget is not self:
+            return
+        for name in ("_poll_after_id", "_color_send_job", "_eyedropper_after_id"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                self.after_cancel(timer)
+                setattr(self, name, None)
+        self._pending_color = None
+        for runner in getattr(self, "threads", {}).values():
+            runner.stop()
+
     def _setup_screen_region_select(self):
-        self.screen_region_lf = ttk.LabelFrame(
-            self, text="Screen Region", padding="3 3 12 12"
-        )
+        self.screen_region_lf = ttk.LabelFrame(self, text="Screen region", padding=8)
         self.screen_region_entries = {
             "left": tkinter.Entry(self.screen_region_lf, width=6),
             "width": tkinter.Entry(self.screen_region_lf, width=6),
@@ -182,12 +188,30 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         self.screen_region_entries["top"].insert(tkinter.END, region[1])
         self.screen_region_entries["width"].insert(tkinter.END, region[2])
         self.screen_region_entries["height"].insert(tkinter.END, region[3])
-        self._grid_horiz_coordinate_box("left", 7, "width")
-        self._grid_horiz_coordinate_box("top", 8, "height")
+        self._grid_horiz_coordinate_box("left", 0, "width")
+        self._grid_horiz_coordinate_box("top", 1, "height")
         tkinter.Button(
             self.screen_region_lf, text="Save", command=self.save_monitor_bounds
-        ).grid(row=9, column=1, sticky="w")
-        self.screen_region_lf.grid(row=7, columnspan=4)
+        ).grid(row=2, column=3, sticky="e", pady=(6, 0))
+        self.screen_region_lf.grid(row=8, columnspan=4, sticky="ew")
+        self.screen_region_lf.grid_remove()
+        self.screen_region_toggle = tkinter.Button(
+            self, text="Screen region...", command=self._toggle_screen_region
+        )
+        self.screen_region_toggle.grid(row=7, columnspan=4, sticky="ew", pady=(6, 0))
+
+    def _toggle_screen_region(self):
+        visible = bool(self.screen_region_lf.winfo_manager())
+        if visible:
+            self.screen_region_lf.grid_remove()
+        else:
+            self.screen_region_lf.grid()
+        self.screen_region_toggle.configure(
+            text="Screen region..." if visible else "Hide screen region"
+        )
+        root = self.winfo_toplevel()
+        root.update_idletasks()
+        root.minsize(root.winfo_reqwidth(), root.winfo_reqheight())
 
     def _grid_horiz_coordinate_box(self, text: str, row, arg2):
         tkinter.Label(self.screen_region_lf, text=text).grid(
@@ -291,12 +315,32 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         tkinter.Button(
             self.special_functions_lf, text="Stop effects", command=self.stop_threads
         ).grid(row=8, column=1)
-        self.special_functions_lf.grid(row=6, columnspan=4)
+        children = self.special_functions_lf.winfo_children()
+        by_text = {child.cget("text"): child for child in children}
+        self.avg_screen_btn.configure(text="Avg. Screen Color")
+        self.dominant_screen_btn.configure(text="Dominant Screen")
+        self.action_buttons = (
+            self.action_sync_btn,
+            by_text["Stop effects"],
+            self.avg_screen_btn,
+            self.dominant_screen_btn,
+            self.music_button,
+            self.color_cycle_btn,
+            by_text["Pick Color"],
+            by_text["Color Eyedropper"],
+        )
+        for column in range(2):
+            self.special_functions_lf.columnconfigure(
+                column, weight=1, uniform="actions"
+            )
+        for index, button in enumerate(self.action_buttons):
+            button.grid(
+                row=index // 2, column=index % 2, sticky="ew", padx=3, pady=2, ipady=2
+            )
+        self.special_functions_lf.grid(row=6, columnspan=4, sticky="ew", pady=(6, 0))
 
     def _setup_color_dropdowns(self):
-        self.preset_colors_lf = ttk.LabelFrame(
-            self, text="Preset Colors", padding="3 3 12 12"
-        )
+        self.preset_colors_lf = ttk.Frame(self, padding=(0, 4))
         self.color_var = tkinter.StringVar(self, value="Presets")
         self.default_colors = {
             "RED": RED,
@@ -315,7 +359,8 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         self.preset_dropdown = tkinter.OptionMenu(
             self.preset_colors_lf, self.color_var, *self.default_colors
         )
-        self.preset_dropdown.grid(row=0, column=0)
+        self.preset_colors_lf.columnconfigure((0, 1), weight=1, uniform="presets")
+        self.preset_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         self.preset_dropdown.configure(width=13)
         self.color_var.trace_add("write", self.change_preset_dropdown)
         self.tk_user_def_color_var = tkinter.StringVar(self, value="User Presets")
@@ -328,12 +373,12 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 else [None]
             ),
         )
-        self.user_dropdown.grid(row=0, column=1)
+        self.user_dropdown.grid(row=0, column=1, sticky="ew", padx=(4, 0))
         self.user_dropdown.config(
             width=13, state="normal" if config["PresetColors"] else "disabled"
         )
         self.tk_user_def_color_var.trace_add("write", self.change_user_dropdown)
-        self.preset_colors_lf.grid(row=5, columnspan=4)
+        self.preset_colors_lf.grid(row=5, columnspan=4, sticky="ew", pady=(6, 0))
 
     def setup_color_controls(self, init_color: Color):
         self.logger.info("Initial light color HSBK: %s", init_color)
@@ -342,8 +387,8 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             background=tuple2hex(hsbk_to_rgb(init_color)),
             width=40,
             height=20,
-            borderwidth=3,
-            relief=tkinter.GROOVE,
+            borderwidth=1,
+            relief=tkinter.FLAT,
         )
         self.current_color.grid(row=0, column=2)
         self.hsbk = (
@@ -395,7 +440,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 gradient="kelvin",
             ),
         )
-        relief = tkinter.GROOVE
+        relief = tkinter.FLAT
         self.hsbk_display: Tuple[
             tkinter.Canvas, tkinter.Canvas, tkinter.Canvas, tkinter.Canvas
         ] = (
@@ -404,7 +449,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 background=tuple2hex(hsv_to_rgb(360 * (init_color.hue / 65535))),
                 width=20,
                 height=20,
-                borderwidth=3,
+                borderwidth=1,
                 relief=relief,
             ),
             tkinter.Canvas(
@@ -418,7 +463,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 ),
                 width=20,
                 height=20,
-                borderwidth=3,
+                borderwidth=1,
                 relief=relief,
             ),
             tkinter.Canvas(
@@ -432,7 +477,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 ),
                 width=20,
                 height=20,
-                borderwidth=3,
+                borderwidth=1,
                 relief=relief,
             ),
             tkinter.Canvas(
@@ -440,7 +485,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                 background=tuple2hex(kelvin_to_rgb(init_color.kelvin)),
                 width=20,
                 height=20,
-                borderwidth=3,
+                borderwidth=1,
                 relief=relief,
             ),
         )
@@ -452,8 +497,9 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
                     key
                 ],
             ).grid(row=key + 1, column=0)
-            scale.grid(row=key + 1, column=1)
-            self.hsbk_labels[key].grid(row=key + 1, column=2)
+            scale.configure(width=round(100 * max(0.75, self.winfo_fpixels("1i") / 96)))
+            scale.grid(row=key + 1, column=1, sticky="ew", padx=3, pady=5)
+            self.hsbk_labels[key].grid(row=key + 1, column=2, padx=(0, 3))
             self.hsbk_display[key].grid(row=key + 1, column=3)
         self.threads: Dict[str, color_thread.ColorThreadRunner] = {}
 
@@ -556,13 +602,25 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             active = name == getattr(self, "_active_effect", None)
             background = button.option_get("background", "Button")
             foreground = button.option_get("foreground", "Button")
+            selection = button.option_get("selectBackground", "Button") or "#2563eb"
             button.config(
                 bg=(
-                    "Green"
+                    selection
                     if active
                     else background or button.configure("background")[3]
                 ),
                 fg=(
+                    "white"
+                    if active
+                    else foreground or button.configure("foreground")[3]
+                ),
+                activebackground=(
+                    selection
+                    if active
+                    else button.option_get("activeBackground", "Button")
+                    or button.configure("activebackground")[3]
+                ),
+                activeforeground=(
                     "white"
                     if active
                     else foreground or button.configure("foreground")[3]
@@ -779,7 +837,9 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         if require_icon_update:
             self.trigger_icon_update()
         if not run_once:
-            self.after(FRAME_PERIOD_MS, self.update_status_from_bulb)
+            self._poll_after_id = self.after(
+                FRAME_PERIOD_MS, self.update_status_from_bulb
+            )
 
     def eyedropper(self, *_, **__):
         """Wait for a click without accessing Tk from an effect worker."""
@@ -908,9 +968,9 @@ class MultiZoneFrame(LightFrame):
             self._initial_state.zones or [tuple(self.get_color_values_hsbk())]
         )
         group = ttk.LabelFrame(self, text="Zones (drag to paint)", padding=4)
-        group.grid(row=8, columnspan=4, sticky="ew")
+        group.grid(row=9, columnspan=4, sticky="ew", pady=(6, 0))
         self.zone_canvas = tkinter.Canvas(
-            group, width=360, height=28, highlightthickness=0
+            group, width=240, height=28, highlightthickness=0
         )
         self.zone_canvas.pack(fill="x")
         self.zone_canvas.bind("<Button-1>", self.paint_zone)
@@ -927,7 +987,10 @@ class MultiZoneFrame(LightFrame):
     def display_zones(self, colors):
         self.zone_colors = [tuple(color) for color in colors]
         self.zone_canvas.delete("all")
-        width = max(self.zone_canvas.winfo_width(), 360)
+        width = max(
+            self.zone_canvas.winfo_width(),
+            self.zone_canvas.winfo_pixels(self.zone_canvas.cget("width")),
+        )
         self.zone_width = width / len(self.zone_colors)
         self.zone_rects = [
             self.zone_canvas.create_rectangle(

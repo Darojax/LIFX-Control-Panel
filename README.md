@@ -73,8 +73,27 @@ Build outputs are written to:
 Rebuilds replace these files in the same folder. Close the running app before rebuilding.
 The demo uses simulated lights and does not discover or control real devices.
 
-The executable stores `config.ini` and its log beside the executable. If no portable
+The executable stores `config.ini` beside the executable. If no portable
 configuration exists yet, settings in the launch directory are used as a legacy fallback.
+
+File logging is **off by default**. **Settings > General > Save diagnostic logs**
+enables it when troubleshooting. Diagnostic files stay beside the executable,
+rotate at 1 MiB, and retain only one backup (2 MiB total). Individual records are
+bounded too, and enabling diagnostics applies the limit to oversized older logs.
+Press **OK** to apply; disabling stops file writes without a restart.
+Debug-console output does not require file logging.
+
+The interface keeps the original compact window width. **Lights** and **Groups**
+tabs above the controls provide live colour indicators and wrapped device names.
+Lists show a scrollbar only when their content overflows. The window can be
+resized vertically, and its eight action buttons form an equal two-column grid.
+Screen colour buttons use the compact labels **Avg. Screen Color** and
+**Dominant Screen**. **Screen region...** expands the capture coordinates when needed.
+
+**Settings** is available directly in the toolbar and groups controls into
+**General**, **Screen**, **Cinema Sync**, **Shortcuts**, and **Presets & audio** tabs.
+The Settings window adjusts its height to the selected tab to avoid empty space.
+Both light and dark themes use the same compact layout and visible active/focus states.
 
 Effects are exclusive for overlapping lights: selecting an effect for a group also
 stops effects on its individual lights. Manual colour changes and shortcuts stop

@@ -60,7 +60,6 @@ from .theme import (
     THEME_LABEL_TO_VALUE,
     apply_theme as apply_ui_theme,
     apply_window_chrome,
-    normalize_theme_preference,
     theme_label_from_value,
     theme_value_from_label,
 )
@@ -228,10 +227,13 @@ class MultiListbox(Frame):  # pylint: disable=too-many-ancestors
         for list_, widget in lists:
             frame = Frame(self)
             frame.pack(side=LEFT, expand=YES, fill=BOTH)
-            Label(frame, text=list_, borderwidth=1, relief=RAISED).pack(fill=X)
+            Label(frame, text=list_, borderwidth=0, anchor="w", padx=6, pady=5).pack(
+                fill=X
+            )
             list_box = Listbox(
                 frame,
                 width=widget,
+                height=6,
                 borderwidth=0,
                 selectborderwidth=0,
                 relief=FLAT,
@@ -244,14 +246,32 @@ class MultiListbox(Frame):  # pylint: disable=too-many-ancestors
             list_box.bind("<Leave>", lambda e: "break")
             list_box.bind("<B2-Motion>", lambda e, s=self: s._b2motion(e.x, e.y))
             list_box.bind("<Button-2>", lambda e, s=self: s._button2(e.x, e.y))
+            list_box.bind("<MouseWheel>", self._mousewheel)
         frame = Frame(self)
-        frame.pack(side=LEFT, fill=Y)
+        self.scroll_frame = frame
         Label(frame, borderwidth=1, relief=RAISED).pack(fill=X)
         scroll = ttk.Scrollbar(
             frame, orient=VERTICAL, command=self._scroll, style="Vertical.TScrollbar"
         )
         scroll.pack(expand=YES, fill=Y)
-        self.lists[0]["yscrollcommand"] = scroll.set
+        self.scrollbar = scroll
+        self.lists[0]["yscrollcommand"] = self._sync_scrollbar
+
+    def _sync_scrollbar(self, first, last):
+        self.scrollbar.set(first, last)
+        if float(first) <= 0 and float(last) >= 1:
+            self.scroll_frame.pack_forget()
+        else:
+            self.scroll_frame.pack(side=LEFT, fill=Y)
+
+    def _mousewheel(self, event):
+        units = (
+            -int(event.delta / 120)
+            if abs(event.delta) >= 120
+            else (-1 if event.delta > 0 else 1)
+        )
+        self._scroll("scroll", units, "units")
+        return "break"
 
     def _select(self, y):  # pylint: disable=invalid-name
         """Select a row when clicked"""
@@ -266,12 +286,18 @@ class MultiListbox(Frame):  # pylint: disable=too-many-ancestors
         return "break"
 
     def _b2motion(self, x, y):  # pylint: disable=invalid-name
+        if self.size() <= int(self.lists[0].cget("height")):
+            return "break"
         for list_ in self.lists:
             list_.scan_dragto(x, y)
         return "break"
 
     def _scroll(self, *args):
         """Move the list down"""
+        if self.size() <= int(self.lists[0].cget("height")):
+            for list_ in self.lists:
+                list_.yview_moveto(0)
+            return
         for list_ in self.lists:
             list_.yview(*args)
 
@@ -333,199 +359,58 @@ class SettingsDisplay(Dialog):
     """Settings form User Interface"""
 
     def body(self, master):
-        self.root_window = master.master.master  # This is really gross. I'm sorry.
+        self.root_window = self.master
+        self.resizable(False, False)
         root_logger = getattr(self.root_window, "logger", logging.getLogger("root"))
         self.logger = logging.getLogger(root_logger.name + ".SettingsDisplay")
         self.key_listener = None
         self._key_capture_after_id = None
+        self._monitor_load_after_id = None
+        self._monitor_poll_after_id = None
         self._monitor_options_queue = queue.Queue(maxsize=1)
         self._action_preview_token = object()
         self._action_preview_closed = False
         self.bind("<Destroy>", self._end_action_preview, add="+")
-        # Labels
-        Label(master, text="Start Minimized?: ").grid(row=0, column=0, sticky="w")
-        Label(master, text="Theme: ").grid(row=1, column=0, sticky="w")
-        Label(master, text="Avg. Monitor Default: ").grid(row=2, column=0, sticky="w")
-        Label(master, text="Smooth Transition Time (sec): ").grid(
-            row=3, column=0, sticky="w"
-        )
-        Label(master, text="Brightness Offset: ").grid(row=4, column=0, sticky="w")
-        Label(master, text="Add Preset Color: ").grid(row=5, column=0, sticky="w")
-        Label(master, text="Audio Input Source: ").grid(row=6, column=0, sticky="w")
-        Label(master, text="Add keyboard shortcut").grid(row=7, column=0, sticky="w")
 
-        # Widgets
-        # Starting minimized
+        self.notebook = ttk.Notebook(master)
+        self.notebook.pack(fill="both", expand=True)
+        self.pages = {}
+        for name in (
+            "General",
+            "Screen",
+            "Cinema Sync",
+            "Shortcuts",
+            "Presets & audio",
+        ):
+            page = ttk.Frame(self.notebook, padding=12)
+            page.columnconfigure(1, weight=1)
+            self.notebook.add(page, text=name)
+            self.pages[name] = page
+
+        def row(page, index, label, widget):
+            Label(page, text=label, anchor="w").grid(
+                row=index, column=0, sticky="w", padx=(0, 16), pady=6
+            )
+            widget.grid(row=index, column=1, sticky="ew", pady=6)
+
+        general = self.pages["General"]
         self.start_mini = BooleanVar(
             master, value=config.getboolean("AppSettings", "start_minimized")
         )
-        self.start_mini_check = Checkbutton(master, variable=self.start_mini)
-        selected_theme = normalize_theme_preference(
-            config.get("AppSettings", "theme", fallback="system")
+        self.start_mini_check = Checkbutton(
+            general, text="Start minimized to tray", variable=self.start_mini
         )
+        self.start_mini_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=8)
         self.theme_selection = StringVar(
-            master, value=theme_label_from_value(selected_theme)
+            master,
+            value=theme_label_from_value(
+                config.get("AppSettings", "theme", fallback="system")
+            ),
         )
         self.theme_dropdown = OptionMenu(
-            master, self.theme_selection, *THEME_LABEL_TO_VALUE.keys()
+            general, self.theme_selection, *THEME_LABEL_TO_VALUE.keys()
         )
-
-        # Avg monitor color match
-        self.avg_monitor = StringVar(
-            master, value=config["AverageColor"]["DefaultMonitor"]
-        )
-        self.avg_monitor_dropdown = OptionMenu(
-            master, self.avg_monitor, self.avg_monitor.get()
-        )
-
-        self.duration_scale = Scale(
-            master, from_=0, to_=2, resolution=1 / 15, orient=HORIZONTAL
-        )
-        self.duration_scale.set(float(config["AverageColor"]["Duration"]))
-
-        self.brightness_offset = Scale(
-            master, from_=0, to_=65535, resolution=1, orient=HORIZONTAL
-        )
-        self.brightness_offset.set(int(config["AverageColor"]["brightnessoffset"]))
-
-        # Custom preset color
-        self.preset_color_name = Entry(master)
-        self.preset_color_name.insert(END, "Enter color name...")
-        self.preset_color_button = Button(
-            master, text="Choose and add!", command=self.get_color
-        )
-
-        # Audio dropdown
-        device_names = self.master.audio_interface.get_device_names()
-        self.audio_choices = {}
-        for index, name in device_names.items():
-            self.audio_choices[f"{index} {name}"] = str(index)
-        configured_input = config.get("Audio", "InputIndex", fallback="")
-        init_string = next(
-            (
-                choice
-                for choice, index in self.audio_choices.items()
-                if index == configured_input
-            ),
-            next(iter(self.audio_choices), "None"),
-        )
-        self.audio_source = StringVar(master, init_string)
-        self.as_dropdown = OptionMenu(
-            master, self.audio_source, *(self.audio_choices.keys() or ["None"])
-        )
-
-        # Add keybindings
-        light_names = list(self.root_window.device_map.keys())
-        self.keybind_bulb_selection = StringVar(
-            master, value=light_names[0] if light_names else "No lights found"
-        )
-        self.keybind_bulb_dropdown = OptionMenu(
-            master, self.keybind_bulb_selection, *(light_names or ["No lights found"])
-        )
-        self.keybind_keys_select = Entry(master)
-        self.keybind_keys_select.insert(END, "Add key-combo...")
-        self.keybind_keys_select.config(state="readonly")
-        self.keybind_keys_select.bind("<FocusIn>", self.on_keybind_keys_click)
-        self.keybind_keys_select.bind("<FocusOut>", self.on_keybind_keys_focus_out)
-        self.keybind_color_selection = StringVar(master, value="Color")
-        first_frame = next(iter(self.root_window.frame_map.values()), None)
-        self._default_colors = (
-            first_frame.default_colors if first_frame else {"RED": RED, "WHITE": WHITE}
-        )
-        self.keybind_color_dropdown = OptionMenu(
-            master,
-            self.keybind_color_selection,
-            *KEYBIND_ACTIONS,
-            *self._default_colors,
-            *(
-                [*config["PresetColors"].keys()]
-                if any(config["PresetColors"].keys())
-                else [None]
-            ),
-        )
-        self.keybind_add_button = Button(
-            master,
-            text="Add keybind",
-            command=lambda *_: self.register_keybinding(
-                self.keybind_bulb_selection.get(),
-                self.keybind_keys_select.get(),
-                self.keybind_color_selection.get(),
-            ),
-        )
-        self.keybind_delete_button = Button(
-            master, text="Delete keybind", command=self.delete_keybind
-        )
-        if not light_names:
-            self.keybind_add_button.config(state="disabled")
-
-        # Insert
-        self.start_mini_check.grid(row=0, column=1, sticky="w")
-        self.theme_dropdown.grid(row=1, column=1, sticky="w")
-        ttk.Separator(master, orient=HORIZONTAL).grid(
-            row=1, sticky="esw", columnspan=100
-        )
-        self.avg_monitor_dropdown.grid(row=2, column=1)
-        self.duration_scale.grid(row=3, column=1)
-        self.brightness_offset.grid(row=4, column=1)
-        ttk.Separator(master, orient=HORIZONTAL).grid(
-            row=4, sticky="esw", columnspan=100
-        )
-        self.preset_color_name.grid(row=5, column=1)
-        self.preset_color_button.grid(row=5, column=2)
-        ttk.Separator(master, orient=HORIZONTAL).grid(
-            row=5, sticky="esw", columnspan=100
-        )
-        self.as_dropdown.grid(row=6, column=1)
-        ttk.Separator(master, orient=HORIZONTAL).grid(
-            row=6, sticky="esw", columnspan=100
-        )
-        self.keybind_bulb_dropdown.grid(row=7, column=1)
-        self.keybind_keys_select.grid(row=7, column=2)
-        self.keybind_color_dropdown.grid(row=7, column=3)
-        self.keybind_add_button.grid(row=7, column=4)
-        self.mlb = MultiListbox(master, (("Bulb", 5), ("Keybind", 5), ("Color", 5)))
-        for keypress, fnx in dict(config["Keybinds"]).items():
-            if ":" not in fnx:
-                continue
-            label, color = fnx.rsplit(":", 1)
-            self.mlb.insert(END, (label, keypress, color))
-        self.mlb.grid(row=8, columnspan=100, sticky="esw")
-        self.keybind_delete_button.grid(row=9, column=0)
-
-        Label(master, text="Screen max brightness (%):").grid(
-            row=10, column=0, sticky="w"
-        )
-        Label(master, text="Screen dark cutoff (%):").grid(row=11, column=0, sticky="w")
-        Label(master, text="Near-black threshold (0–255):").grid(
-            row=12, column=0, sticky="w"
-        )
-        self.max_brightness = Scale(
-            master, from_=0, to_=100, resolution=0.1, orient=HORIZONTAL
-        )
-        self.max_brightness.set(
-            config.getint("AverageColor", "maxbrightness", fallback=65535) * 100 / 65535
-        )
-        self.min_brightness_cutoff = Scale(
-            master, from_=0, to_=100, resolution=0.1, orient=HORIZONTAL
-        )
-        self.min_brightness_cutoff.set(
-            config.getint("AverageColor", "minbrightnesscutoff", fallback=0)
-            * 100
-            / 65535
-        )
-        self.near_black_threshold = Scale(
-            master, from_=0, to_=255, resolution=1, orient=HORIZONTAL
-        )
-        self.near_black_threshold.set(
-            config.getint("AverageColor", "nearblackthreshold", fallback=10)
-        )
-        self.max_brightness.grid(row=10, column=1, sticky="w")
-        self.min_brightness_cutoff.grid(row=11, column=1, sticky="w")
-        self.near_black_threshold.grid(row=12, column=1, sticky="w")
-        Label(master, text="0 disables near-black filtering").grid(
-            row=12, column=2, columnspan=3, sticky="w"
-        )
-
+        row(general, 0, "Appearance", self.theme_dropdown)
         self.launch_startup = BooleanVar(master, value=get_launch_on_startup())
         self.restore_startup = BooleanVar(
             master,
@@ -534,24 +419,76 @@ class SettingsDisplay(Dialog):
             ),
         )
         Checkbutton(
-            master,
+            general,
             text="Launch with Windows",
             variable=self.launch_startup,
             state="normal" if sys.platform == "win32" else "disabled",
-        ).grid(row=13, column=0, sticky="w")
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=8)
         Checkbutton(
-            master,
+            general,
             text="Restore saved lights on startup",
             variable=self.restore_startup,
-        ).grid(row=13, column=1, columnspan=3, sticky="w")
-
-        action_group = ttk.LabelFrame(
-            master, text="Cinema Sync (movie room light)", padding=4
+        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=8)
+        self.diagnostic_logging = BooleanVar(
+            master,
+            value=config.getboolean(
+                "AppSettings", "diagnostic_logging", fallback=False
+            ),
         )
-        action_group.grid(row=14, column=0, columnspan=5, sticky="ew", pady=(6, 0))
+        Checkbutton(
+            general,
+            text="Save diagnostic logs (max 2 MB)",
+            variable=self.diagnostic_logging,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=8)
+
+        screen = self.pages["Screen"]
+        self.avg_monitor = StringVar(
+            master, value=config["AverageColor"]["DefaultMonitor"]
+        )
+        self.avg_monitor_dropdown = OptionMenu(
+            screen, self.avg_monitor, self.avg_monitor.get()
+        )
+        row(screen, 0, "Default display / region", self.avg_monitor_dropdown)
+        self.duration_scale = Scale(
+            screen, from_=0, to_=2, resolution=1 / 15, orient=HORIZONTAL, length=240
+        )
+        self.duration_scale.set(config.getfloat("AverageColor", "duration"))
+        row(screen, 1, "Screen transition (seconds)", self.duration_scale)
+        self.brightness_offset = Scale(
+            screen, from_=0, to_=65535, resolution=1, orient=HORIZONTAL, length=240
+        )
+        self.brightness_offset.set(config.getint("AverageColor", "brightnessoffset"))
+        row(screen, 2, "Brightness offset", self.brightness_offset)
+        self.max_brightness = Scale(
+            screen, from_=0, to_=100, resolution=0.1, orient=HORIZONTAL, length=240
+        )
+        self.max_brightness.set(
+            config.getint("AverageColor", "maxbrightness", fallback=65535) * 100 / 65535
+        )
+        row(screen, 3, "Maximum brightness (%)", self.max_brightness)
+        self.min_brightness_cutoff = Scale(
+            screen, from_=0, to_=100, resolution=0.1, orient=HORIZONTAL, length=240
+        )
+        self.min_brightness_cutoff.set(
+            config.getint("AverageColor", "minbrightnesscutoff", fallback=0)
+            * 100
+            / 65535
+        )
+        row(screen, 4, "Dark cutoff (%)", self.min_brightness_cutoff)
+        self.near_black_threshold = Scale(
+            screen, from_=0, to_=255, resolution=1, orient=HORIZONTAL, length=240
+        )
+        self.near_black_threshold.set(
+            config.getint("AverageColor", "nearblackthreshold", fallback=10)
+        )
+        row(screen, 5, "Near-black filter (0 = off)", self.near_black_threshold)
+
+        cinema = self.pages["Cinema Sync"]
+        cinema.columnconfigure(0, weight=1, uniform="cinema")
+        cinema.columnconfigure(1, weight=1, uniform="cinema")
         self.action_controls = {}
         self._action_variables = {}
-        for column, (key, label, minimum, maximum, default) in enumerate(
+        for index, (key, label, minimum, maximum, default) in enumerate(
             (
                 ("impact", "Impact (%)", 0, 100, 80),
                 ("response", "Response (%)", 0, 100, 90),
@@ -559,25 +496,127 @@ class SettingsDisplay(Dialog):
                 ("brightness", "Brightness (%)", 0, 100, 100),
             )
         ):
-            Label(action_group, text=label).grid(row=0, column=column, sticky="w")
+            group = ttk.LabelFrame(cinema, text=label, padding=10)
+            group.grid(row=index // 2, column=index % 2, sticky="ew", padx=4, pady=6)
             variable = DoubleVar(
-                action_group, value=config.getfloat("ActionSync", key, fallback=default)
+                group, value=config.getfloat("ActionSync", key, fallback=default)
             )
             control = Scale(
-                action_group,
+                group,
                 from_=minimum,
                 to_=maximum,
                 resolution=1,
                 orient=HORIZONTAL,
-                length=160,
+                length=220,
                 variable=variable,
             )
-            control.grid(row=1, column=column, sticky="w", padx=(0, 12))
+            control.pack(fill="x")
             self.action_controls[key] = control
             self._action_variables[key] = variable
         for variable in self._action_variables.values():
             variable.trace_add("write", self._preview_action_sync)
-        self.after_idle(self._load_monitor_options_async)
+
+        presets = self.pages["Presets & audio"]
+        self.preset_color_name = Entry(presets, width=30)
+        self.preset_color_name.insert(END, "Enter colour name...")
+        row(presets, 0, "Preset name", self.preset_color_name)
+        self.preset_color_button = Button(
+            presets, text="Choose colour and add", command=self.get_color
+        )
+        self.preset_color_button.grid(row=1, column=1, sticky="ew", pady=(0, 18))
+        self.audio_choices = {
+            f"{index} {name}": str(index)
+            for index, name in self.master.audio_interface.get_device_names().items()
+        }
+        configured_input = config.get("Audio", "InputIndex", fallback="")
+        initial = next(
+            (
+                choice
+                for choice, index in self.audio_choices.items()
+                if index == configured_input
+            ),
+            next(iter(self.audio_choices), "None"),
+        )
+        self.audio_source = StringVar(master, value=initial)
+        self.as_dropdown = OptionMenu(
+            presets, self.audio_source, *(self.audio_choices.keys() or ["None"])
+        )
+        self.as_dropdown.configure(width=32, anchor="w")
+        row(presets, 2, "Audio input", self.as_dropdown)
+
+        shortcuts = self.pages["Shortcuts"]
+        shortcuts.columnconfigure((0, 1), weight=1)
+        light_names = list(self.root_window.device_map.keys())
+        self.keybind_bulb_selection = StringVar(
+            master, value=light_names[0] if light_names else "No lights found"
+        )
+        self.keybind_bulb_dropdown = OptionMenu(
+            shortcuts,
+            self.keybind_bulb_selection,
+            *(light_names or ["No lights found"]),
+        )
+        self.keybind_bulb_dropdown.grid(
+            row=0, column=0, sticky="ew", padx=(0, 6), pady=4
+        )
+        self.keybind_keys_select = Entry(shortcuts, width=24)
+        self.keybind_keys_select.insert(END, "Select shortcut keys...")
+        self.keybind_keys_select.configure(state="readonly")
+        self.keybind_keys_select.bind("<FocusIn>", self.on_keybind_keys_click)
+        self.keybind_keys_select.bind("<FocusOut>", self.on_keybind_keys_focus_out)
+        self.keybind_keys_select.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=4)
+        self.keybind_color_selection = StringVar(master, value="Color")
+        first_frame = next(iter(self.root_window.frame_map.values()), None)
+        self._default_colors = (
+            first_frame.default_colors if first_frame else {"RED": RED, "WHITE": WHITE}
+        )
+        self.keybind_color_dropdown = OptionMenu(
+            shortcuts,
+            self.keybind_color_selection,
+            *KEYBIND_ACTIONS,
+            *self._default_colors,
+            *(config["PresetColors"].keys() or [None]),
+        )
+        self.keybind_color_dropdown.grid(
+            row=1, column=0, sticky="ew", padx=(0, 6), pady=4
+        )
+        self.keybind_add_button = Button(
+            shortcuts,
+            text="Add shortcut",
+            command=lambda: self.register_keybinding(
+                self.keybind_bulb_selection.get(),
+                self.keybind_keys_select.get(),
+                self.keybind_color_selection.get(),
+            ),
+        )
+        self.keybind_add_button.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=4)
+        if not light_names:
+            self.keybind_add_button.configure(state="disabled")
+        self.mlb = MultiListbox(
+            shortcuts, (("Light", 18), ("Shortcut", 18), ("Action / colour", 22))
+        )
+        for keypress, function in dict(config["Keybinds"]).items():
+            if ":" in function:
+                label, colour = function.rsplit(":", 1)
+                self.mlb.insert(END, (label, keypress, colour))
+        self.mlb.grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
+        self.keybind_delete_button = Button(
+            shortcuts, text="Remove selected shortcut", command=self.delete_keybind
+        )
+        self.keybind_delete_button.grid(row=3, column=0, columnspan=2, sticky="e")
+        self.notebook.bind("<<NotebookTabChanged>>", self._fit_settings_page)
+        self._fit_settings_page()
+        self._monitor_load_after_id = self.after_idle(self._load_monitor_options_async)
+
+    def _fit_settings_page(self, event=None):
+        self.update_idletasks()
+        selected = self.notebook.select()
+        if not selected:
+            return
+        page = self.nametowidget(selected)
+        self.notebook.configure(height=page.winfo_reqheight())
+        self.update_idletasks()
+        if self.winfo_viewable():
+            self.geometry(f"{self.winfo_reqwidth()}x{self.winfo_reqheight()}")
 
     def _preview_action_sync(self, *_):
         """Publish numeric values without exposing Tk variables to effect workers."""
@@ -600,6 +639,8 @@ class SettingsDisplay(Dialog):
         ):
             _action_sync_preview = None
         self._action_preview_closed = True
+        if event is not None:
+            self._shutdown_settings_listener()
 
     def validate(self) -> int:
         if self.min_brightness_cutoff.get() > self.max_brightness.get():
@@ -634,6 +675,7 @@ class SettingsDisplay(Dialog):
             self.restore_startup.get()
         )
         config["AppSettings"]["start_minimized"] = str(self.start_mini.get())
+        config["AppSettings"]["diagnostic_logging"] = str(self.diagnostic_logging.get())
         config["AppSettings"]["theme"] = theme_value_from_label(
             self.theme_selection.get()
         )
@@ -648,6 +690,9 @@ class SettingsDisplay(Dialog):
         save_config()
         self._end_action_preview()
 
+        if hasattr(self.root_window, "apply_logging"):
+            self.root_window.apply_logging()
+
         if hasattr(self.root_window, "apply_theme"):
             self.root_window.apply_theme(config["AppSettings"]["theme"])
 
@@ -661,9 +706,10 @@ class SettingsDisplay(Dialog):
         return super().cancel(_)
 
     def _load_monitor_options_async(self):
+        self._monitor_load_after_id = None
         thread = threading.Thread(target=self._collect_monitor_options, daemon=True)
         thread.start()
-        self.after(40, self._poll_monitor_options)
+        self._monitor_poll_after_id = self.after(40, self._poll_monitor_options)
 
     def _collect_monitor_options(self):
         options = ["full", "get_primary_monitor"]
@@ -678,12 +724,13 @@ class SettingsDisplay(Dialog):
             pass
 
     def _poll_monitor_options(self):
+        self._monitor_poll_after_id = None
         if not self.winfo_exists():
             return
         try:
             options = self._monitor_options_queue.get_nowait()
         except queue.Empty:
-            self.after(40, self._poll_monitor_options)
+            self._monitor_poll_after_id = self.after(40, self._poll_monitor_options)
             return
         self.avg_monitor_dropdown["menu"].delete(0, END)
         for option in options:
@@ -772,6 +819,11 @@ class SettingsDisplay(Dialog):
             self.keybind_keys_select.config(state="readonly")
 
     def _shutdown_settings_listener(self):
+        for name in ("_monitor_load_after_id", "_monitor_poll_after_id"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                self.after_cancel(timer)
+                setattr(self, name, None)
         self._stop_keybind_capture()
         if self.key_listener is not None:
             self.key_listener.shutdown()

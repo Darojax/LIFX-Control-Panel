@@ -135,3 +135,28 @@ Base commit: `ac245dd`. Recorded on 2026-11-03.
 - Refresh the feature overview, audio installation instructions, and Cinema Sync control documentation.
 - Remove superseded build and test scratch logs while retaining the current build receipt.
 - Pin the formatting hook to the verified Black release instead of a mutable reference.
+
+## UI refresh after 7c13557
+
+- Arrange all eight effect and tool buttons in an equal four-row, two-column grid.
+- Replace horizontal bitmap icon strips with compact device lists and live colour indicators.
+- Place light and group navigation in compact tabs above the controls to preserve the original window width.
+- Show navigation scrollbars only when content overflows and clamp scrolling after resizing.
+- Preserve full device names with wrapping and ignore clicks on empty navigation space.
+- Group Settings into five compact tabs without changing saved values or live Cinema Sync previews.
+- Fit the Settings window height to the active tab instead of reserving empty space for every page.
+- Prevent short shortcut tables from scrolling past their content.
+- Collapse advanced screen-region controls until they are needed.
+- Add a direct Settings toolbar button and allow vertical window resizing without widening the default layout.
+- Use consistent typography, flat controls, subtle borders, and readable light and dark palettes.
+- Keep active effects, hover text, keyboard focus, and colour previews readable in both themes.
+- Cancel owned polling and queued UI callbacks when their windows are destroyed.
+- Add geometry, label-fit, scrolling, theme, and timer-cleanup regressions.
+- Restore compact sliders and shorten screen-effect button labels to fit the original width.
+- Fit multizone controls within the same compact window width.
+- Check full light, group, and strip panels against the pre-refresh width in both themes.
+- Disable file logging by default and make diagnostic logging an explicit General setting.
+- Limit diagnostic logging to a one-megabyte file and one backup with bounded UTF-8 records.
+- Apply diagnostic retention limits to oversized legacy files when logging is enabled.
+- Stop diagnostic writes immediately when disabled and avoid duplicate logging handlers.
+- Test disabled logging, retention, UTF-8 rotation, oversized records, and repeated reconfiguration.

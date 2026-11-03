@@ -18,7 +18,6 @@ import tkinter
 import tkinter.colorchooser
 import traceback
 from collections import OrderedDict, defaultdict
-from logging.handlers import RotatingFileHandler
 from PIL import Image
 from tkinter import messagebox, ttk
 from typing import Dict, Union, Optional, cast
@@ -50,6 +49,7 @@ from lifx_control_panel.utilities.device_actions import (
     restore_device,
 )
 from lifx_control_panel.utilities.desktop import configure_dpi
+from lifx_control_panel.utilities.logging_setup import configure_logging
 from lifx_control_panel.utilities.async_bulb_interface import AsyncBulbInterface
 from lifx_control_panel.utilities.keypress import KeybindManager
 from lifx_control_panel.utilities.discovery import (
@@ -82,18 +82,20 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         # We take a lifx instance, so we can inject our own for testing.
 
         # Setup frame and grid
-        ttk.Frame.__init__(self, master, padding="3 3 12 12")
+        ttk.Frame.__init__(self, master, padding=6)
         self.master = master
         self._closing = False
         self.commands = CommandGate()
         self._action_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self._tray_targets = ()
         self._ui_queue = queue.Queue()
-        self.after(40, self._drain_ui_queue)
+        self._ui_drain_after = self.after(40, self._drain_ui_queue)
+        self._icon_after = None
+        self.bind("<Destroy>", self._dispose_ui_timers, add="+")
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.grid(column=0, row=0, sticky="nwes")
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(1, weight=1)
+        self.rowconfigure(2, weight=1)
         self.lifx: lifxlan.LifxLAN = lifx_instance
         self.bulb_interface: AsyncBulbInterface = bulb_interface
         self.audio_interface = audio.AudioInterface()
@@ -106,7 +108,9 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.logger.info("Root logger initialized: %s", self.logger.name)
         self.logger.info("Binary Version: %s", VERSION)
         self.logger.info("Build time: %s", BUILD_DATE)
-        self.columnconfigure(1, weight=1)
+        self._theme_applying = False
+        self._unmap_bind_id = None
+        self._file_menu_open = False
         self._build_menu_strip()
 
         # Initialize LIFX objects
@@ -118,12 +122,20 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.current_lightframe: Optional[LightFrame] = (
             None  # currently selected and visible LightFrame
         )
-        self.bulb_icons = BulbIconList(self)
-        self.group_icons = BulbIconList(self, is_group=True)
-        self._theme_applying = False
-        self._unmap_bind_id = None
-        self._file_menu_open = False
-
+        self.device_tabs = ttk.Notebook(self)
+        self.device_tabs.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.bulb_icons = BulbIconList(
+            self.device_tabs, owner=self, compact=True, show_heading=False
+        )
+        self.group_icons = BulbIconList(
+            self.device_tabs,
+            is_group=True,
+            owner=self,
+            compact=True,
+            show_heading=False,
+        )
+        self.device_tabs.add(self.bulb_icons, text="Lights")
+        self.device_tabs.add(self.group_icons, text="Groups")
         self.scan_for_lights()
 
         if any(self.device_map):
@@ -135,14 +147,12 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
                 " to search again.",
             )
 
-        self.bulb_icons.grid(row=2, column=1, sticky="w")
         self.bulb_icons.canvas.bind("<Button-1>", self.on_bulb_canvas_click)
         # Keep light-name in sync with drop-down selection
         self.tk_light_name.trace_add("write", self.bulb_changed)
         if self.tk_light_name.get():
             self.bulb_changed()
 
-        self.group_icons.grid(row=3, column=1, sticky="w")
         self.group_icons.canvas.bind("<Button-1>", self.on_bulb_canvas_click)
 
         # Menus read an immutable snapshot; their callbacks enqueue UI actions.
@@ -177,7 +187,7 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.apply_theme(config.get("AppSettings", "theme", fallback="system"))
 
         # Start icon callback
-        self.after(FRAME_PERIOD_MS, self.update_icons)
+        self._icon_after = self.after(FRAME_PERIOD_MS, self.update_icons)
 
         if config.getboolean("AppSettings", "restore_state_on_startup", fallback=False):
             self.restore_state()
@@ -233,7 +243,7 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
                     )
                     frame = frame_type(self, light, initial_state=state)
                     self.frame_map[label] = frame
-                    frame.grid_configure(row=1)
+                    frame.grid_configure(row=2)
                 else:
                     frame = self.frame_map[label]
                     frame.target = light
@@ -273,7 +283,7 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         if group_label not in self.frame_map:
             frame = GroupFrame(self, state.device, initial_state=state)
             self.frame_map[group_label] = frame
-            frame.grid_configure(row=1)
+            frame.grid_configure(row=2)
         else:
             frame = self.frame_map[group_label]
             frame.target = state.device
@@ -297,6 +307,12 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
             self.frame_map[new_light_label].get_label(),
         )
         self.current_lightframe = self.frame_map[new_light_label]
+        if hasattr(self, "device_tabs"):
+            self.device_tabs.select(
+                self.group_icons
+                if isinstance(self.current_lightframe, GroupFrame)
+                else self.bulb_icons
+            )
         self.current_lightframe.restart()
         if (
             self.current_lightframe
@@ -315,8 +331,8 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         # Convert to Canvas coords as we are using a Scrollbar, so Frame coords doesn't always match up.
         x_canvas = canvas.canvasx(event.x)
         y_canvas = canvas.canvasy(event.y)
-        item = canvas.find_closest(x_canvas, y_canvas)
-        tags = canvas.gettags(item) if item else ()
+        items = canvas.find_overlapping(x_canvas, y_canvas, x_canvas, y_canvas)
+        tags = canvas.gettags(items[-1]) if items else ()
         if not tags or tags[0] not in self.frame_map:
             return
         light_name = tags[0]
@@ -332,12 +348,15 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
 
     def update_icons(self):
         """If the window isn't minimized, redraw icons to reflect their current power/color state."""
+        self._icon_after = None
+        if self._closing:
+            return
         if self.master.winfo_viewable():
             for frame in self.frame_map.values():
                 if not isinstance(frame, GroupFrame) and frame.icon_update_flag:
                     self.bulb_icons.update_icon(cast(lifxlan.Device, frame.target))
                     frame.icon_update_flag = False
-        self.after(FRAME_PERIOD_MS, self.update_icons)
+        self._icon_after = self.after(FRAME_PERIOD_MS, self.update_icons)
 
     def save_keybind(self, light, keypress, color):
         def apply_color():
@@ -564,6 +583,14 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.master.after_idle(self._clear_theme_applying)
         self.logger.info("Theme set to %s (resolved: %s)", preference, resolved)
 
+    def apply_logging(self):
+        configure_logging(
+            LOGFILE,
+            diagnostics=config.getboolean(
+                "AppSettings", "diagnostic_logging", fallback=False
+            ),
+        )
+
     def _clear_theme_applying(self):
         self._theme_applying = False
 
@@ -650,8 +677,8 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
     def _build_menu_strip(self):
         """Create an in-window menu strip so dark mode can be fully themed."""
         self.menu_strip = tkinter.Frame(self, relief=tkinter.FLAT, borderwidth=0)
-        self.menu_strip.grid(row=0, column=1, sticky="ew", pady=(0, 3))
-        self.menu_strip.columnconfigure(2, weight=1)
+        self.menu_strip.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.menu_strip.columnconfigure(3, weight=1)
 
         self.file_button = tkinter.Button(
             self.menu_strip,
@@ -740,7 +767,10 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
             padx=10,
             pady=3,
         )
-        self.about_button.grid(row=0, column=1, sticky="w")
+        self.about_button.grid(row=0, column=2, sticky="w")
+        tkinter.Button(
+            self.menu_strip, text="Settings", command=self.show_settings
+        ).grid(row=0, column=1, padx=4)
 
         self.master.bind_all("<Button-1>", self._on_global_click, add="+")
         self.master.bind("<Configure>", self._on_master_configure, add="+")
@@ -767,7 +797,7 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
 
     def _reposition_file_dropdown(self):
         self.update_idletasks()
-        x_pos = self.file_button.winfo_x()
+        x_pos = self.menu_strip.winfo_x() + self.file_button.winfo_x()
         y_pos = self.menu_strip.winfo_y() + self.menu_strip.winfo_height()
         self.file_dropdown.place(x=x_pos, y=y_pos, anchor="nw")
 
@@ -848,6 +878,7 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         if self._closing:
             return
         self._closing = True
+        self._dispose_ui_timers()
         self.logger.info("Shutting down.\n")
         for frame in self.frame_map.values():
             frame.stop_threads()
@@ -860,12 +891,22 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.audio_interface.close()
         self.master.destroy()
 
+    def _dispose_ui_timers(self, event=None):
+        if event is not None and event.widget is not self:
+            return
+        for name in ("_ui_drain_after", "_icon_after"):
+            timer = getattr(self, name, None)
+            if timer is not None:
+                self.after_cancel(timer)
+                setattr(self, name, None)
+
     def post_ui(self, callback):
         """Workers enqueue actions; only the Tk thread touches widgets."""
         if not self._closing:
             self._ui_queue.put(callback)
 
     def _drain_ui_queue(self):
+        self._ui_drain_after = None
         if self._closing:
             return
         for _ in range(100):
@@ -879,7 +920,7 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
                 self.logger.exception("UI callback failed")
             if self._closing:
                 return
-        self.after(40, self._drain_ui_queue)
+        self._ui_drain_after = self.after(40, self._drain_ui_queue)
 
 
 def main(lifx_instance=None):
@@ -892,7 +933,9 @@ def main(lifx_instance=None):
         root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72)
         root.withdraw()
         root.title("LIFX Control Panel")
-        root.resizable(False, False)
+        root.resizable(False, True)
+        root.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
 
         theme_pref = normalize_theme_preference(
             config.get("AppSettings", "theme", fallback="system")
@@ -902,19 +945,12 @@ def main(lifx_instance=None):
         # Setup main_icon
         root.iconbitmap(resource_path("res/icon_vector.ico"))
 
-        app_logger.setLevel(logging.DEBUG)
-        file_handler = RotatingFileHandler(
-            LOGFILE, maxBytes=5 * 1024 * 1024, backupCount=1
+        app_logger = configure_logging(
+            LOGFILE,
+            diagnostics=config.getboolean(
+                "AppSettings", "diagnostic_logging", fallback=False
+            ),
         )
-        formatter = logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        )
-        file_handler.setFormatter(formatter)
-        app_logger.addHandler(file_handler)
-        stream_handler = logging.StreamHandler()
-        stream_handler.setLevel(logging.DEBUG)
-        stream_handler.setFormatter(formatter)
-        app_logger.addHandler(stream_handler)
         app_logger.info("Logger initialized.")
         setattr(root, "_lifx_logger", app_logger)
 
@@ -942,6 +978,8 @@ def main(lifx_instance=None):
             ),
             AsyncBulbInterface(threading.Event(), HEARTBEAT_RATE_MS),
         )
+        root.update_idletasks()
+        root.minsize(root.winfo_reqwidth(), root.winfo_reqheight())
         if not config.getboolean("AppSettings", "start_minimized"):
             root.deiconify()
 

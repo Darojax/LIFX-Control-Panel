@@ -3,7 +3,7 @@
 import ctypes
 import sys
 import tkinter
-from tkinter import ttk
+from tkinter import ttk, font
 
 try:
     import winreg
@@ -21,11 +21,11 @@ THEME_VALUE_TO_LABEL = {value: label for label, value in THEME_LABEL_TO_VALUE.it
 
 THEME_PALETTES = {
     "dark": {
-        "background": "#12161c",
+        "background": "#151b25",
         "foreground": "#eef2f6",
-        "button": "#202734",
-        "button_active": "#2a3344",
-        "field": "#1a202b",
+        "button": "#263244",
+        "button_active": "#33435a",
+        "field": "#1d2735",
         "selection": "#2f6db4",
         "selection_fg": "#ffffff",
         "disabled": "#8a95a5",
@@ -35,15 +35,15 @@ THEME_PALETTES = {
         "menu_fg": "#eef2f6",
     },
     "light": {
-        "background": "#f6f6f6",
-        "foreground": "#202020",
-        "button": "#efefef",
-        "button_active": "#e3e3e3",
+        "background": "#f4f6fa",
+        "foreground": "#172333",
+        "button": "#ffffff",
+        "button_active": "#e8eef8",
         "field": "#ffffff",
         "selection": "#2f5f9f",
         "selection_fg": "#ffffff",
         "disabled": "#7a7a7a",
-        "border": "#c8c8c8",
+        "border": "#d2dbe8",
         "accent": "#2f5f9f",
         "menu_bg": "#f6f6f6",
         "menu_fg": "#202020",
@@ -123,11 +123,16 @@ def apply_window_chrome(window: tkinter.Misc, preference: str) -> str:
 
 def _apply_palette_defaults(root: tkinter.Tk, palette: dict) -> None:
     _safe_config(root, bg=palette["background"])
+    for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+        font.nametofont(name, root=root).configure(family="Segoe UI", size=9)
+    font.nametofont("TkHeadingFont", root=root).configure(
+        family="Segoe UI", size=10, weight="bold"
+    )
 
     root.option_add("*Background", palette["background"])
     root.option_add("*Foreground", palette["foreground"])
     root.option_add("*activeBackground", palette["button_active"])
-    root.option_add("*activeForeground", palette["selection_fg"])
+    root.option_add("*activeForeground", palette["foreground"])
     root.option_add("*highlightBackground", palette["background"])
     root.option_add("*highlightColor", palette["accent"])
     root.option_add("*selectBackground", palette["selection"])
@@ -177,6 +182,24 @@ def _apply_ttk_style(root: tkinter.Tk, palette: dict) -> None:
         "TLabel", background=palette["background"], foreground=palette["foreground"]
     )
     style.configure(
+        "Section.TLabel", font="TkHeadingFont", foreground=palette["foreground"]
+    )
+    style.configure("TNotebook", background=palette["background"], borderwidth=0)
+    style.configure(
+        "TNotebook.Tab",
+        padding=(12, 7),
+        background=palette["button"],
+        foreground=palette["foreground"],
+    )
+    style.map(
+        "TNotebook.Tab",
+        background=[
+            ("selected", palette["field"]),
+            ("active", palette["button_active"]),
+        ],
+        foreground=[("selected", palette["accent"])],
+    )
+    style.configure(
         "TLabelframe",
         background=palette["background"],
         bordercolor=palette["border"],
@@ -189,6 +212,7 @@ def _apply_ttk_style(root: tkinter.Tk, palette: dict) -> None:
         "TLabelframe.Label",
         background=palette["background"],
         foreground=palette["foreground"],
+        font="TkHeadingFont",
     )
     style.configure(
         "TButton",
@@ -199,10 +223,13 @@ def _apply_ttk_style(root: tkinter.Tk, palette: dict) -> None:
     style.map(
         "TButton",
         background=[
-            ("active", palette["button_active"]),
             ("pressed", palette["selection"]),
+            ("active", palette["button_active"]),
         ],
-        foreground=[("disabled", palette["disabled"])],
+        foreground=[
+            ("disabled", palette["disabled"]),
+            ("pressed", palette["selection_fg"]),
+        ],
     )
     style.configure(
         "TMenubutton", background=palette["button"], foreground=palette["foreground"]
@@ -279,8 +306,11 @@ def _style_widget_tree(widget: tkinter.Misc, palette: dict) -> None:
             bg=palette["button"],
             fg=palette["foreground"],
             activebackground=palette["button_active"],
-            activeforeground=palette["selection_fg"],
+            activeforeground=palette["foreground"],
             highlightbackground=palette["background"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
         )
         try:
             menu = widget.nametowidget(widget["menu"])
@@ -293,7 +323,7 @@ def _style_widget_tree(widget: tkinter.Misc, palette: dict) -> None:
             bg=palette["button"],
             fg=palette["foreground"],
             activebackground=palette["button_active"],
-            activeforeground=palette["selection_fg"],
+            activeforeground=palette["foreground"],
             highlightbackground=palette["background"],
         )
     elif isinstance(
@@ -317,8 +347,15 @@ def _style_widget_tree(widget: tkinter.Misc, palette: dict) -> None:
             bg=palette["button"],
             fg=palette["foreground"],
             activebackground=palette["button_active"],
-            activeforeground=palette["selection_fg"],
-            highlightbackground=palette["background"],
+            activeforeground=palette["foreground"],
+            highlightbackground=palette["border"],
+            highlightcolor=palette["accent"],
+            highlightthickness=1,
+            relief="flat",
+            borderwidth=0,
+            padx=9,
+            pady=3,
+            disabledforeground=palette["disabled"],
         )
     elif isinstance(widget, tkinter.Entry):
         _safe_config(
@@ -330,7 +367,11 @@ def _style_widget_tree(widget: tkinter.Misc, palette: dict) -> None:
             selectforeground=palette["selection_fg"],
             readonlybackground=palette["field"],
             disabledforeground=palette["disabled"],
-            highlightbackground=palette["background"],
+            highlightbackground=palette["border"],
+            highlightcolor=palette["accent"],
+            highlightthickness=1,
+            relief="flat",
+            borderwidth=0,
         )
     elif isinstance(widget, tkinter.Listbox):
         _safe_config(
@@ -447,6 +488,8 @@ def _style_canvas(canvas: tkinter.Canvas, palette: dict) -> None:
     for item_id in canvas.find_all():
         if canvas.type(item_id) == "text":
             _safe_config_canvas_item(canvas, item_id, fill=palette["foreground"])
+    if hasattr(canvas.master, "apply_palette"):
+        canvas.master.apply_palette(palette)
 
 
 def _is_color_preview_canvas(canvas: tkinter.Canvas) -> bool:

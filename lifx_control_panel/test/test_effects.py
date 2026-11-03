@@ -57,7 +57,11 @@ class EffectSelectionTests(unittest.TestCase):
                     for key, other in buttons.items():
                         self.assertEqual(
                             other.cget("background"),
-                            "Green" if key == name else THEME_PALETTES[mode]["button"],
+                            (
+                                THEME_PALETTES[mode]["selection"]
+                                if key == name
+                                else THEME_PALETTES[mode]["button"]
+                            ),
                         )
             frame.stop_threads()
             self.assertTrue(
