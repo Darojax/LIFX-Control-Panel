@@ -160,3 +160,61 @@ Base commit: `ac245dd`. Recorded on 2026-11-03.
 - Apply diagnostic retention limits to oversized legacy files when logging is enabled.
 - Stop diagnostic writes immediately when disabled and avoid duplicate logging handlers.
 - Test disabled logging, retention, UTF-8 rotation, oversized records, and repeated reconfiguration.
+
+## Dropdown and menu polish after f9a2b02
+
+- Replace legacy preset and Settings dropdowns with consistently styled readonly selectors.
+- Use clear arrows, balanced insets, and readable selection and disabled states in both themes.
+- Display friendly preset and monitor labels while preserving stored values and capture coordinates.
+- Fit long names in the popup without widening the main window.
+- Show dropdown scrollbars only when their choices overflow the available rows.
+- Prevent mouse-wheel movement over a closed dropdown from changing settings or the lamp.
+- Preserve repeated preset selection so the same colour can be applied again.
+- Disable empty selectors with useful placeholder text instead of an empty or None choice.
+- Refresh choices without triggering actions and remove variable traces when controls are destroyed.
+- Keep newly created dropdowns consistent with the selected app theme after rescans.
+- Give File, Settings, and About matching compact toolbar controls.
+- Replace the File menu overlay with a bordered popup containing spaced and grouped commands.
+- Support keyboard menu navigation, Escape dismissal, outside clicks, focus changes, and window minimization.
+- Release menu grabs before running commands and clean up owned bindings and delayed callbacks.
+- Keep popups within their display's working area, including displays with negative desktop coordinates.
+- Scale dropdown arrows, popup insets, and menu rows with display density.
+- Preserve the accepted 293-pixel main-window width at the same display scaling.
+- Add offline regressions for dropdown selection, themes, geometry, scrolling, monitor values, and menu lifecycle.
+
+Validation for this pass:
+
+- Pass 121 tests with two existing skips and no Tk callback errors.
+- Measure light, group, and strip panels at 293 pixels wide before and after the change at 96 DPI.
+- Measure widths of 407 versus 410 pixels at 150 percent Tk scaling and 518 versus 528 pixels at 200 percent Tk scaling.
+- Verify the final UI through automated widget checks without desktop input.
+- Rebuild normal, debug, and offline demo executables in the existing dist folder.
+- Verify packaged UI code and entrypoints against source and confirm diagnostic logging remains disabled by default.
+
+Normal executable SHA-256: `bdc3e719254afaf802c80db763ae4c5a439888eee68414d8f8535b806d69ef2b`.
+
+## Settings toggle and effect-state recall
+
+- Toggle one Settings window from either the toolbar or File menu without opening duplicates.
+- Keep the main controls usable while Settings is open.
+- Document that lighting keyboard shortcuts pause until Settings closes.
+- Treat toggling Settings closed as Cancel and restore unsaved Cinema Sync previews.
+- Preserve OK saving and release Settings listeners, timers, and references on every close path.
+- Capture each physical light's colour, brightness, Kelvin, power, and strip zones before an effect starts.
+- Retain the original light state when switching or reselecting any of the five effects.
+- Restore original states when Stop effects is pressed, including individual states within groups.
+- Restore unused group members when an effect moves from a group to a member.
+- Let manual commands supersede effects and establish a fresh baseline for the next effect.
+- Read and restore light states off the UI thread using the existing ordered device commands.
+- Prevent delayed captures, restores, and UI previews from overriding newer user choices.
+- Cancel pending effect starts when stopped or when their panel is destroyed.
+- Report snapshot failures before starting an effect and retain failed restores for a Stop effects retry.
+- Keep effect-state recall in session memory without creating another file.
+- Document failed-restore retries and the lifetime of temporary effect-state memory.
+- Add regressions for all effect modes, rapid handoffs, cancellation, groups, zones, failures, and Settings lifecycle.
+
+Validation: 139 tests passed with two existing skips, including the unchanged compact-width checks and retrying a failed group restore from the same member's Stop button.
+
+Rebuilt all three executables in the existing dist folder and verified packaged code and default-off diagnostic logging against source.
+
+Normal executable SHA-256: `3235fa72f64a632a4228883dddf1ce275f81c0b9262a08c475a66c7c6b152f00`.

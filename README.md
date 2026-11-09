@@ -95,9 +95,42 @@ Screen colour buttons use the compact labels **Avg. Screen Color** and
 The Settings window adjusts its height to the selected tab to avoid empty space.
 Both light and dark themes use the same compact layout and visible active/focus states.
 
+Click **Settings** in the toolbar or File menu to open it, and click either
+Settings command again to close it. The main controls stay usable while Settings
+is open. Closing this way acts like **Cancel**, including restoring unsaved Cinema
+Sync slider previews; **OK** saves changes.
+Lighting keyboard shortcuts pause while Settings is open and resume when it closes.
+
+Preset and Settings dropdowns share themed fields, clear arrows, and readable
+selection states. Long names expand the popup without widening the main window;
+long lists show a scrollbar, while short lists fit their content. Scrolling over
+a closed dropdown does not change its selection or the lamp. Display choices use
+readable names and dimensions while preserving saved capture coordinates.
+
+The **File** menu uses a bordered popup with spaced, grouped commands. Open it
+with **Alt+F** or focus **File** and press **Down**; use arrow keys and **Enter** to
+choose a command. **Escape**, clicking outside, or switching away dismisses it.
+Popups stay within the working area of the display containing their control.
+
 Effects are exclusive for overlapping lights: selecting an effect for a group also
 stops effects on its individual lights. Manual colour changes and shortcuts stop
 effects on the affected lights. Unrelated lights can run their own effects.
+
+Starting Cinema Sync, Avg. Screen Color, Dominant Screen, Music Color, or Color
+Cycle remembers each affected light's original colour, brightness, Kelvin, power,
+and strip zones before the effect sends its first colour. Switching between
+effects keeps that same original. **Stop effects** restores it, including each
+group member's individual state. Switching from a group to a member restores the
+other members that are no longer running an effect.
+
+Manual colour and power commands supersede effects and become the starting state
+for the next effect. Rapid starts, stops, and manual changes cancel stale work so
+an older restore cannot overwrite a newer choice. This memory lasts for the
+current app session; **File > Save current state** provides a separate saved state
+for later launches.
+If restoration fails because a light is unreachable, reconnect it and press
+**Stop effects** again to retry its remembered state. Closing the app clears this
+temporary memory.
 
 Slider drags send the newest colour at most once every 50 ms, including the final
 value after release. Choosing a preset, power control, or effect cancels pending

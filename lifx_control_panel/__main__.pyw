@@ -30,6 +30,7 @@ from lifx_control_panel._constants import BUILD_DATE, AUTHOR, DEBUGGING, VERSION
 from lifx_control_panel.frames import LightFrame, MultiZoneFrame, GroupFrame
 from lifx_control_panel.ui import settings
 from lifx_control_panel.ui.icon_list import BulbIconList
+from lifx_control_panel.ui.dropdown import MenuPopup
 from lifx_control_panel.ui.settings import config, save_config
 from lifx_control_panel.ui.theme import (
     THEME_PALETTES,
@@ -50,6 +51,7 @@ from lifx_control_panel.utilities.device_actions import (
 )
 from lifx_control_panel.utilities.desktop import configure_dpi
 from lifx_control_panel.utilities.logging_setup import configure_logging
+from lifx_control_panel.utilities.effect_state import EffectMemory
 from lifx_control_panel.utilities.async_bulb_interface import AsyncBulbInterface
 from lifx_control_panel.utilities.keypress import KeybindManager
 from lifx_control_panel.utilities.discovery import (
@@ -86,6 +88,8 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.master = master
         self._closing = False
         self.commands = CommandGate()
+        self.effect_states = EffectMemory(self.commands)
+        self._settings_window = None
         self._action_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
         self._tray_targets = ()
         self._ui_queue = queue.Queue()
@@ -110,7 +114,6 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         self.logger.info("Build time: %s", BUILD_DATE)
         self._theme_applying = False
         self._unmap_bind_id = None
-        self._file_menu_open = False
         self._build_menu_strip()
 
         # Initialize LIFX objects
@@ -550,19 +553,96 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         """Deletes anonymous function from key_listener. Don't know why this is needed."""
         self.key_listener.unregister_function(keycombo)
 
+    def restore_effect_states(self, leases):
+        """Restore released originals off-thread without overwriting newer input."""
+        if not leases or self._closing:
+            return
+        pending = []
+        for lease in leases:
+            self.commands.invalidate(lease.device)
+            pending.append((lease, self.commands.ticket(lease.device)))
+
+        def restore():
+            restored, errors = [], []
+            for lease, ticket in pending:
+                try:
+
+                    def write(device):
+                        if not self.effect_states.current(lease):
+                            return
+                        state = self.effect_states.snapshot(lease)
+                        cancelled = lambda: not self.commands.current(
+                            ticket
+                        ) or not self.effect_states.current(lease)
+                        if state is not None:
+                            restore_device(device, state, cancelled=cancelled)
+                        if not cancelled():
+                            self.effect_states.complete(lease)
+                            if state is not None:
+                                restored.append((lease.key, state, ticket))
+
+                    self.commands.write(lease.device, write, ticket)
+                except Exception as exc:
+                    if self.effect_states.current(lease):
+                        errors.append(f"{lease.device.label}: {exc}")
+            return restored, errors
+
+        def display(result):
+            restored, errors = result
+            states = {
+                key: state
+                for key, state, token in restored
+                if self.commands.current(token)
+            }
+            for frame in self.frame_map.values():
+                if not frame.winfo_exists():
+                    continue
+                keys = [device_key(device) for device in devices_in(frame.target)]
+                if not keys or not all(key in states for key in keys):
+                    continue
+                state = states[keys[0]]
+                frame.apply_color_preview(state["color"])
+                frame.tk_power_var.set(any(states[key]["power"] for key in keys))
+                if state["zones"] and hasattr(frame, "display_zones"):
+                    frame.display_zones(state["zones"])
+            if errors:
+                messagebox.showerror(
+                    "Unable to restore light state", "\n".join(errors), parent=self
+                )
+
+        self.run_device_job(restore, display)
+
     def show_settings(self):
-        """Show the settings dialog box over the master window."""
+        """Toggle one modeless Settings window; closing discards unsaved edits."""
+        dialog = self._settings_window
+        if dialog is not None and dialog.winfo_exists():
+            dialog.cancel()
+            return
         self.key_listener.shutdown()
-        previous_audio_input = config.get("Audio", "InputIndex", fallback="")
+        self._settings_audio_input = config.get("Audio", "InputIndex", fallback="")
         try:
-            settings.SettingsDisplay(self, "Settings")
-        finally:
+            self._settings_window = settings.SettingsDisplay(
+                self, "Settings", modal=False, on_close=self._settings_closed
+            )
+            self.settings_button.state(["selected"])
+        except Exception:
             self.key_listener.restart()
+            raise
+
+    def _settings_closed(self, dialog):
+        if self._settings_window is not dialog:
+            return
+        self._settings_window = None
+        if self.settings_button.winfo_exists():
+            self.settings_button.state(["!selected"])
+        if self._closing:
+            return
+        self.key_listener.restart()
         for frame in self.frame_map.values():
             frame.update_user_dropdown()
         current_audio_input = config.get("Audio", "InputIndex", fallback="")
         if (
-            current_audio_input != previous_audio_input
+            current_audio_input != self._settings_audio_input
             or not self.audio_interface.initialized
         ):
             for frame in self.frame_map.values():
@@ -620,209 +700,63 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         return cast(tkinter.Tk, self.winfo_toplevel())
 
     def _apply_menu_theme(self, palette):
-        try:
-            self.menu_strip.configure(bg=palette["menu_bg"])
-            self.file_button.configure(
-                bg=palette["menu_bg"],
-                fg=palette["menu_fg"],
-                activebackground=palette["selection"],
-                activeforeground=palette["selection_fg"],
-                highlightbackground=palette["menu_bg"],
-            )
-            self.about_button.configure(
-                bg=palette["menu_bg"],
-                fg=palette["menu_fg"],
-                activebackground=palette["selection"],
-                activeforeground=palette["selection_fg"],
-                highlightbackground=palette["menu_bg"],
-            )
-            self.file_dropdown.configure(
-                bg=palette["menu_bg"],
-                relief=tkinter.FLAT,
-                borderwidth=0,
-                highlightbackground=palette["menu_bg"],
-            )
-            self.file_rescan_button.configure(
-                bg=palette["menu_bg"],
-                fg=palette["menu_fg"],
-                activebackground=palette["selection"],
-                activeforeground=palette["selection_fg"],
-                highlightbackground=palette["menu_bg"],
-            )
-            self.file_settings_button.configure(
-                bg=palette["menu_bg"],
-                fg=palette["menu_fg"],
-                activebackground=palette["selection"],
-                activeforeground=palette["selection_fg"],
-                highlightbackground=palette["menu_bg"],
-            )
-            self.file_exit_button.configure(
-                bg=palette["menu_bg"],
-                fg=palette["menu_fg"],
-                activebackground=palette["selection"],
-                activeforeground=palette["selection_fg"],
-                highlightbackground=palette["menu_bg"],
-            )
-            for button in self.state_menu_buttons:
-                button.configure(
-                    bg=palette["menu_bg"],
-                    fg=palette["menu_fg"],
-                    activebackground=palette["selection"],
-                    activeforeground=palette["selection_fg"],
-                )
-            self.file_separator.configure(bg=palette["border"])
-        except tkinter.TclError:
-            pass
+        self.file_dropdown.apply_palette(palette)
 
     def _build_menu_strip(self):
-        """Create an in-window menu strip so dark mode can be fully themed."""
-        self.menu_strip = tkinter.Frame(self, relief=tkinter.FLAT, borderwidth=0)
+        """Use consistent toolbar controls and an independently sized menu."""
+        self.menu_strip = ttk.Frame(self)
         self.menu_strip.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         self.menu_strip.columnconfigure(3, weight=1)
-
-        self.file_button = tkinter.Button(
+        self.file_button = ttk.Button(
             self.menu_strip,
             text="File",
-            relief=tkinter.FLAT,
-            borderwidth=0,
-            highlightthickness=0,
-            padx=10,
-            pady=3,
-            anchor="w",
+            width=0,
+            style="Toolbar.TButton",
             command=self._toggle_file_dropdown,
         )
         self.file_button.grid(row=0, column=0, sticky="w")
-
-        self.file_dropdown = tkinter.Frame(
-            self,
-            relief=tkinter.FLAT,
-            borderwidth=0,
-            highlightthickness=0,
-            bd=0,
-        )
-        self.file_rescan_button = tkinter.Button(
-            self.file_dropdown,
-            text="Rescan",
-            anchor="w",
-            relief=tkinter.FLAT,
-            borderwidth=0,
-            highlightthickness=0,
-            padx=10,
-            pady=4,
-            command=lambda: self._run_file_menu_action(self.scan_for_lights),
-        )
-        self.file_rescan_button.pack(fill="x")
-        self.file_settings_button = tkinter.Button(
-            self.file_dropdown,
+        self.settings_button = ttk.Button(
+            self.menu_strip,
             text="Settings",
-            anchor="w",
-            relief=tkinter.FLAT,
-            borderwidth=0,
-            highlightthickness=0,
-            padx=10,
-            pady=4,
-            command=lambda: self._run_file_menu_action(self.show_settings),
+            width=0,
+            style="Toolbar.TButton",
+            command=self.show_settings,
         )
-        self.file_settings_button.pack(fill="x")
-        self.state_menu_buttons = []
-        for label, callback in (
-            ("Save current state", self.save_state),
-            ("Restore saved state", self.restore_state),
-        ):
-            button = tkinter.Button(
-                self.file_dropdown,
-                text=label,
-                anchor="w",
-                relief=tkinter.FLAT,
-                borderwidth=0,
-                padx=10,
-                pady=4,
-                command=lambda action=callback: self._run_file_menu_action(action),
-            )
-            button.pack(fill="x")
-            self.state_menu_buttons.append(button)
-        self.file_separator = tkinter.Frame(self.file_dropdown, height=1, bd=0)
-        self.file_separator.pack(fill="x", padx=2, pady=2)
-        self.file_exit_button = tkinter.Button(
-            self.file_dropdown,
-            text="Exit",
-            anchor="w",
-            relief=tkinter.FLAT,
-            borderwidth=0,
-            highlightthickness=0,
-            padx=10,
-            pady=4,
-            command=lambda: self._run_file_menu_action(self.on_closing),
-        )
-        self.file_exit_button.pack(fill="x")
-        self.file_dropdown.place_forget()
-
-        self.about_button = tkinter.Button(
+        self.settings_button.grid(row=0, column=1, padx=2)
+        self.about_button = ttk.Button(
             self.menu_strip,
             text="About",
+            width=0,
+            style="Toolbar.TButton",
             command=self.show_about,
-            relief=tkinter.FLAT,
-            borderwidth=0,
-            highlightthickness=0,
-            padx=10,
-            pady=3,
         )
         self.about_button.grid(row=0, column=2, sticky="w")
-        tkinter.Button(
-            self.menu_strip, text="Settings", command=self.show_settings
-        ).grid(row=0, column=1, padx=4)
-
-        self.master.bind_all("<Button-1>", self._on_global_click, add="+")
-        self.master.bind("<Configure>", self._on_master_configure, add="+")
-
-    def _run_file_menu_action(self, callback):
-        self._hide_file_dropdown()
-        callback()
+        self.file_dropdown = MenuPopup(self, self.file_button, mnemonic="f")
+        self.file_rescan_button = self.file_dropdown.add_command(
+            "Rescan lights", self.scan_for_lights
+        )
+        self.file_settings_button = self.file_dropdown.add_command(
+            "Settings", self.show_settings
+        )
+        self.file_dropdown.add_separator()
+        self.state_menu_buttons = [
+            self.file_dropdown.add_command("Save current state", self.save_state),
+            self.file_dropdown.add_command("Restore saved state", self.restore_state),
+        ]
+        self.file_dropdown.add_separator()
+        self.file_exit_button = self.file_dropdown.add_command("Exit", self.on_closing)
 
     def _toggle_file_dropdown(self):
-        if self._file_menu_open:
-            self._hide_file_dropdown()
+        if self.file_dropdown.is_open:
+            self.file_dropdown.hide()
         else:
-            self._show_file_dropdown()
+            self.file_dropdown.show()
 
     def _show_file_dropdown(self):
-        self._file_menu_open = True
-        self._reposition_file_dropdown()
-        self.file_dropdown.lift()
+        self.file_dropdown.show()
 
     def _hide_file_dropdown(self):
-        if self._file_menu_open:
-            self.file_dropdown.place_forget()
-            self._file_menu_open = False
-
-    def _reposition_file_dropdown(self):
-        self.update_idletasks()
-        x_pos = self.menu_strip.winfo_x() + self.file_button.winfo_x()
-        y_pos = self.menu_strip.winfo_y() + self.menu_strip.winfo_height()
-        self.file_dropdown.place(x=x_pos, y=y_pos, anchor="nw")
-
-    def _on_master_configure(self, *_):
-        if self._file_menu_open:
-            self._reposition_file_dropdown()
-
-    def _on_global_click(self, event):
-        if not self._file_menu_open:
-            return
-        widget = event.widget
-        if widget is self.file_button:
-            return
-        parent = widget
-        while parent is not None:
-            if parent is self.file_dropdown:
-                return
-            parent_name = parent.winfo_parent()
-            if not parent_name:
-                break
-            try:
-                parent = parent.nametowidget(parent_name)
-            except tkinter.TclError:
-                break
-        self._hide_file_dropdown()
+        self.file_dropdown.hide()
 
     def show_about(self):
         """Show a themed About dialog above the main window."""
@@ -878,6 +812,9 @@ class LifxFrame(ttk.Frame):  # pylint: disable=too-many-ancestors
         if self._closing:
             return
         self._closing = True
+        if self._settings_window is not None and self._settings_window.winfo_exists():
+            self._settings_window.destroy()
+        self._hide_file_dropdown()
         self._dispose_ui_timers()
         self.logger.info("Shutting down.\n")
         for frame in self.frame_map.values():

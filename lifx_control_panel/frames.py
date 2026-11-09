@@ -2,7 +2,7 @@ import logging
 import queue
 import math
 import tkinter
-from tkinter import ttk, messagebox, _setit
+from tkinter import ttk, messagebox
 from typing import Union, Tuple, Dict, Mapping
 
 import mouse
@@ -25,6 +25,7 @@ from lifxlan import (
 
 from lifx_control_panel import RED, FRAME_PERIOD_MS
 from lifx_control_panel.ui.colorscale import ColorScale
+from lifx_control_panel.ui.dropdown import ChoiceDropdown
 from lifx_control_panel.ui.settings import config, save_config
 from lifx_control_panel.utilities import color_thread
 from lifx_control_panel.utilities.discovery import prefetch_device, group_state
@@ -62,9 +63,9 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
     preset_colors_lf: ttk.LabelFrame
     color_var: tkinter.StringVar
     default_colors: Mapping[str, Color]
-    preset_dropdown: tkinter.OptionMenu
+    preset_dropdown: ChoiceDropdown
     tk_user_def_color_var: tkinter.StringVar
-    user_dropdown: tkinter.OptionMenu
+    user_dropdown: ChoiceDropdown
     current_color: tkinter.Canvas
     hsbk: Tuple[tkinter.IntVar, tkinter.IntVar, tkinter.IntVar, tkinter.IntVar]
     hsbk_labels: Tuple[tkinter.Label, tkinter.Label, tkinter.Label, tkinter.Label]
@@ -89,6 +90,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
         self._color_send_job = None
         self._poll_after_id = None
         self._pending_color = None
+        self._effect_request = None
         self.bind("<Destroy>", self._dispose_frame, add="+")
         self.icon_update_flag: bool = True
         # Initialize LightFrames
@@ -154,6 +156,11 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
     def _dispose_frame(self, event):
         if event.widget is not self:
             return
+        self._effect_request = None
+        gate = getattr(self.master, "commands", None)
+        target = getattr(self, "target", None)
+        if gate is not None and target is not None:
+            gate.invalidate(target)
         for name in ("_poll_after_id", "_color_send_job", "_eyedropper_after_id"):
             timer = getattr(self, name, None)
             if timer is not None:
@@ -313,7 +320,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             command=self.eyedropper,
         ).grid(row=7, column=1)
         tkinter.Button(
-            self.special_functions_lf, text="Stop effects", command=self.stop_threads
+            self.special_functions_lf, text="Stop effects", command=self.stop_effects
         ).grid(row=8, column=1)
         children = self.special_functions_lf.winfo_children()
         by_text = {child.cget("text"): child for child in children}
@@ -356,27 +363,25 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             "WARM_WHITE": WARM_WHITE,
             "GOLD": GOLD,
         }
-        self.preset_dropdown = tkinter.OptionMenu(
-            self.preset_colors_lf, self.color_var, *self.default_colors
+        self.preset_dropdown = ChoiceDropdown(
+            self.preset_colors_lf,
+            self.color_var,
+            {name: name.replace("_", " ").capitalize() for name in self.default_colors},
+            placeholder="Presets",
+            width=12,
         )
         self.preset_colors_lf.columnconfigure((0, 1), weight=1, uniform="presets")
         self.preset_dropdown.grid(row=0, column=0, sticky="ew", padx=(0, 4))
-        self.preset_dropdown.configure(width=13)
         self.color_var.trace_add("write", self.change_preset_dropdown)
         self.tk_user_def_color_var = tkinter.StringVar(self, value="User Presets")
-        self.user_dropdown = tkinter.OptionMenu(
+        self.user_dropdown = ChoiceDropdown(
             self.preset_colors_lf,
             self.tk_user_def_color_var,
-            *(
-                [*config["PresetColors"].keys()]
-                if any(config["PresetColors"].keys())
-                else [None]
-            ),
+            config["PresetColors"].keys(),
+            placeholder="User presets",
+            width=12,
         )
         self.user_dropdown.grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        self.user_dropdown.config(
-            width=13, state="normal" if config["PresetColors"] else "disabled"
-        )
         self.tk_user_def_color_var.trace_add("write", self.change_user_dropdown)
         self.preset_colors_lf.grid(row=5, columnspan=4, sticky="ew", pady=(6, 0))
 
@@ -561,16 +566,60 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
     def _start_effect(self, name, button):
         """Give one effect exclusive control of this light or group."""
-        self._stop_conflicting_effects()
+        stopped = self._stop_conflicting_effects(preserve_effect_state=True)
+        memory = getattr(self.master, "effect_states", None)
+        if memory is None:
+            self._run_effect(name)
+            return
+        claims, restores = memory.begin(self.target, self, stopped)
+        self.master.restore_effect_states(restores)
+        request = self._effect_request = object()
+        self._active_effect = name
+        self.refresh_effect_buttons()
+        ticket = self.master.commands.ticket(self.target)
+
+        def capture():
+            try:
+                return memory.capture(claims, ticket), None
+            except Exception as exc:  # A failed snapshot must not start an effect.
+                return False, str(exc)
+
+        def ready(result):
+            if self._effect_request is not request:
+                return
+            self._effect_request = None
+            captured, error = result
+            if captured and self.master.commands.current(ticket):
+                self._run_effect(name)
+            else:
+                self.stop_effects()
+                if error:
+                    messagebox.showerror(
+                        "Unable to remember light state", error, parent=self
+                    )
+
+        self.master.run_device_job(capture, ready)
+
+    def _run_effect(self, name):
         try:
             self.threads[name].start()
         except (ValueError, tkinter.TclError) as exc:
+            self.stop_effects()
             messagebox.showerror("Unable to start effect", str(exc), parent=self)
             return
         self._active_effect = name
         self.refresh_effect_buttons()
 
-    def _stop_conflicting_effects(self, keep_pending=False):
+    def stop_effects(self):
+        """Stop overlapping effects and restore each light's original state."""
+        stopped = self._stop_conflicting_effects(preserve_effect_state=True)
+        memory = getattr(self.master, "effect_states", None)
+        if memory is not None:
+            self.master.restore_effect_states(memory.release(self.target, stopped))
+
+    def _stop_conflicting_effects(
+        self, keep_pending=False, preserve_effect_state=False
+    ):
         """A group and its individual lights must not compete for the same bulb."""
 
         def device_ids(target):
@@ -584,10 +633,18 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
             }
 
         own_devices = device_ids(self.target)
+        stopped = [self]
         for frame in getattr(self.master, "frame_map", {}).values():
             if frame is not self and own_devices & device_ids(frame.target):
                 frame.stop_threads(invalidate_commands=False)
+                stopped.append(frame)
         self.stop_threads(cancel_pending=not keep_pending)
+        memory = getattr(self.master, "effect_states", None)
+        if memory is not None and not preserve_effect_state:
+            self.master.restore_effect_states(
+                memory.release(self.target, stopped, discard_target=True)
+            )
+        return stopped
 
     def refresh_effect_buttons(self):
         """Restore theme colours while retaining the active effect indicator."""
@@ -629,6 +686,11 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
     def effect_finished(self, runner):
         """Clear a finished effect on the GUI thread, including after a failure."""
+        if (
+            not self.winfo_exists()
+            or getattr(self, "_effect_request", None) is not None
+        ):
+            return
         name = getattr(self, "_active_effect", None)
         if name and self.threads[name] is runner and not runner.is_running():
             self._active_effect = None
@@ -636,6 +698,7 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
     def stop_threads(self, cancel_pending=True, invalidate_commands=True):
         """Stop all ColorRunner threads"""
+        self._effect_request = None
         if cancel_pending:
             self._cancel_pending_color()
         gate = getattr(self.master, "commands", None)
@@ -887,42 +950,17 @@ class LightFrame(ttk.Labelframe):  # pylint: disable=too-many-ancestors
 
     def change_preset_dropdown(self, *_, **__):
         """Change device color to selected preset option."""
-        color = Color(*globals()[self.color_var.get()])
-        self._style_color_dropdown(self.preset_dropdown, color)
+        color = Color(*self.default_colors[self.color_var.get()])
         self.set_color(color, False)
 
     def change_user_dropdown(self, *_, **__):
         """Change device color to selected user-defined option."""
         color = str2tuple(config["PresetColors"][self.tk_user_def_color_var.get()], int)
-        self._style_color_dropdown(self.user_dropdown, color)
         self.set_color(color, rapid=False)
-
-    @staticmethod
-    def _style_color_dropdown(dropdown, color):
-        red, green, blue = hsbk_to_rgb(color)
-        foreground = (
-            "black" if 0.299 * red + 0.587 * green + 0.114 * blue > 145 else "white"
-        )
-        background = tuple2hex((red, green, blue))
-        dropdown.config(
-            bg=background,
-            fg=foreground,
-            activebackground=background,
-            activeforeground=foreground,
-        )
 
     def update_user_dropdown(self):
         """Add newly defined color to the user color dropdown menu."""
-        # self.tk_user_def_color_var.set('')
-        self.user_dropdown["menu"].delete(0, "end")
-        self.user_dropdown.config(
-            state="normal" if config["PresetColors"] else "disabled"
-        )
-
-        for choice in config["PresetColors"]:
-            self.user_dropdown["menu"].add_command(
-                label=choice, command=_setit(self.tk_user_def_color_var, choice)
-            )
+        self.user_dropdown.set_choices(config["PresetColors"].keys())
 
     def get_monitor_bounds(self):
         """Return the 4 rectangle coordinates from the entry boxes in the UI"""

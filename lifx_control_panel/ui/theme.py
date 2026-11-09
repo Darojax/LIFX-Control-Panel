@@ -96,6 +96,7 @@ def apply_theme(root: tkinter.Misc, preference: str) -> str:
     """Apply theme preference to tkinter and ttk widgets."""
     resolved_mode = resolve_theme_mode(preference)
     palette = THEME_PALETTES[resolved_mode]
+    root._root()._lifx_palette = palette
 
     _apply_palette_defaults(root, palette)
     _apply_ttk_style(root, palette)
@@ -171,6 +172,7 @@ def _apply_palette_defaults(root: tkinter.Tk, palette: dict) -> None:
 
 def _apply_ttk_style(root: tkinter.Tk, palette: dict) -> None:
     style = ttk.Style(root)
+    scale = root.winfo_fpixels("1i") / 96
     if "clam" in style.theme_names():
         style.theme_use("clam")
 
@@ -232,6 +234,28 @@ def _apply_ttk_style(root: tkinter.Tk, palette: dict) -> None:
         ],
     )
     style.configure(
+        "Toolbar.TButton",
+        padding=(10, 4),
+        background=palette["background"],
+        borderwidth=0,
+        relief="flat",
+        focusthickness=1,
+        focuscolor=palette["accent"],
+    )
+    style.map(
+        "Toolbar.TButton",
+        background=[
+            ("selected", palette["selection"]),
+            ("pressed", palette["selection"]),
+            ("active", palette["button_active"]),
+        ],
+        foreground=[
+            ("disabled", palette["disabled"]),
+            ("selected", palette["selection_fg"]),
+            ("pressed", palette["selection_fg"]),
+        ],
+    )
+    style.configure(
         "TMenubutton", background=palette["button"], foreground=palette["foreground"]
     )
     style.map("TMenubutton", background=[("active", palette["button_active"])])
@@ -253,6 +277,52 @@ def _apply_ttk_style(root: tkinter.Tk, palette: dict) -> None:
         fieldbackground=[("readonly", palette["field"])],
         selectbackground=[("readonly", palette["selection"])],
         selectforeground=[("readonly", palette["selection_fg"])],
+    )
+    style.configure(
+        "Dropdown.TCombobox",
+        padding=tuple(round(value * scale) for value in (7, 4, 4, 4)),
+        arrowsize=round(12 * scale),
+        arrowcolor=palette["foreground"],
+        borderwidth=1,
+        relief="flat",
+        lightcolor=palette["border"],
+        darkcolor=palette["border"],
+    )
+    style.map(
+        "Dropdown.TCombobox",
+        fieldbackground=[
+            ("disabled", palette["background"]),
+            ("readonly", palette["field"]),
+        ],
+        background=[
+            ("disabled", palette["background"]),
+            ("pressed", palette["button_active"]),
+            ("active", palette["button_active"]),
+        ],
+        foreground=[
+            ("disabled", palette["disabled"]),
+            ("readonly", palette["foreground"]),
+        ],
+        arrowcolor=[("disabled", palette["disabled"])],
+        bordercolor=[
+            ("focus", palette["accent"]),
+            ("active", palette["accent"]),
+        ],
+        lightcolor=[("focus", palette["accent"])],
+        darkcolor=[("focus", palette["accent"])],
+        # Selecting a value should not leave a solid blue text-selection block
+        # in the closed control; the open list has its own selection colors.
+        selectbackground=[("readonly", palette["field"])],
+        selectforeground=[("readonly", palette["foreground"])],
+    )
+    style.configure(
+        "ComboboxPopdownFrame",
+        background=palette["field"],
+        bordercolor=palette["border"],
+        lightcolor=palette["border"],
+        darkcolor=palette["border"],
+        borderwidth=1,
+        relief="solid",
     )
     style.configure("TSeparator", background=palette["border"])
     style.configure(
@@ -436,6 +506,9 @@ def _style_widget_tree(widget: tkinter.Misc, palette: dict) -> None:
 
     for child in widget.winfo_children():
         _style_widget_tree(child, palette)
+
+    if hasattr(widget, "apply_palette"):
+        widget.apply_palette(palette)
 
 
 def _style_menu(menu: tkinter.Menu, palette: dict) -> None:

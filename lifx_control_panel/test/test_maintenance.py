@@ -105,12 +105,18 @@ class TkStateTests(TkFixture):
 
     def test_white_preset_keeps_readable_text_in_dark_mode(self):
         frame = self.make_frame("First", 100)
-        from lifx_control_panel.ui.theme import apply_theme
+        from lifx_control_panel.ui.theme import THEME_PALETTES, apply_theme
 
         apply_theme(self.root, "dark")
         frame.color_var.set("WHITE")
-        self.assertEqual(frame.preset_dropdown.cget("foreground"), "black")
-        self.assertEqual(frame.preset_dropdown.cget("activeforeground"), "black")
+        dropdown = frame.preset_dropdown
+        self.assertEqual(dropdown.get(), "White")
+        self.assertEqual(
+            ttk.Style(self.root).lookup(
+                dropdown.cget("style"), "foreground", ["readonly"]
+            ),
+            THEME_PALETTES["dark"]["foreground"],
+        )
 
     def test_eyedropper_can_be_cancelled_without_a_worker(self):
         frame = self.make_frame("First", 100)

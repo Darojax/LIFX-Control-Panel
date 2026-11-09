@@ -39,7 +39,6 @@ from tkinter import (
     DoubleVar,
     Checkbutton,
     StringVar,
-    OptionMenu,
     Scale,
     HORIZONTAL,
     Entry,
@@ -63,6 +62,7 @@ from .theme import (
     theme_label_from_value,
     theme_value_from_label,
 )
+from .dropdown import ChoiceDropdown
 
 CONFIG_PATH = (
     Path(sys.executable).parent / "config.ini"
@@ -120,9 +120,12 @@ DATE_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
 class Dialog(Toplevel):
     """Template for dialogs that include an Ok and Cancel button, and return validated user input data."""
 
-    def __init__(self, parent: ttk.Frame, title=None):
+    def __init__(self, parent: ttk.Frame, title=None, *, modal=True, on_close=None):
         Toplevel.__init__(self, parent)
         self.withdraw()
+        self._on_close = on_close
+        self._show_after_id = None
+        self._dialog_closed = False
         self._alpha_hidden = False
         try:
             # Keep the dialog fully invisible while widgets/layout/style settle.
@@ -140,11 +143,13 @@ class Dialog(Toplevel):
         self.buttonbox()
         preference = config.get("AppSettings", "theme", fallback="system")
         apply_ui_theme(self, preference)
-        self.grab_set()
+        if modal:
+            self.grab_set()
         if not self.initial_focus:
             self.initial_focus = self
         self.protocol("WM_DELETE_WINDOW", self.cancel)
         self.bind("<Map>", self._refresh_theme, add="+")
+        self.bind("<Destroy>", self._dialog_destroyed, add="+")
 
         # Build final geometry while still hidden so the first paint is complete.
         self.update_idletasks()
@@ -155,18 +160,30 @@ class Dialog(Toplevel):
         self.geometry(f"{width}x{height}+{x_pos}+{y_pos}")
 
         self.deiconify()
-        self.after_idle(self._show_when_ready)
+        self._show_after_id = self.after_idle(self._show_when_ready)
         self.initial_focus.focus_set()
-        self.wait_window(self)
+        if modal:
+            self.wait_window(self)
 
     def _show_when_ready(self):
         """Finalize visibility after the dialog and native chrome are fully styled."""
+        self._show_after_id = None
         self._refresh_theme()
         if self._alpha_hidden:
             try:
                 self.attributes("-alpha", 1.0)
             except Exception:  # pylint: disable=broad-except
                 pass
+
+    def _dialog_destroyed(self, event):
+        if event.widget is not self or self._dialog_closed:
+            return
+        self._dialog_closed = True
+        if self._show_after_id is not None:
+            self.after_cancel(self._show_after_id)
+            self._show_after_id = None
+        if self._on_close is not None:
+            self._on_close(self)
 
     def _refresh_theme(self, *_):
         """Refresh native window chrome for this dialog."""
@@ -407,8 +424,8 @@ class SettingsDisplay(Dialog):
                 config.get("AppSettings", "theme", fallback="system")
             ),
         )
-        self.theme_dropdown = OptionMenu(
-            general, self.theme_selection, *THEME_LABEL_TO_VALUE.keys()
+        self.theme_dropdown = ChoiceDropdown(
+            general, self.theme_selection, THEME_LABEL_TO_VALUE.keys()
         )
         row(general, 0, "Appearance", self.theme_dropdown)
         self.launch_startup = BooleanVar(master, value=get_launch_on_startup())
@@ -445,8 +462,16 @@ class SettingsDisplay(Dialog):
         self.avg_monitor = StringVar(
             master, value=config["AverageColor"]["DefaultMonitor"]
         )
-        self.avg_monitor_dropdown = OptionMenu(
-            screen, self.avg_monitor, self.avg_monitor.get()
+        monitor_choices = {
+            "full": "All displays",
+            "get_primary_monitor": "Primary display",
+        }
+        if self.avg_monitor.get() not in monitor_choices:
+            monitor_choices[self.avg_monitor.get()] = (
+                f"Custom region · {self.avg_monitor.get()}"
+            )
+        self.avg_monitor_dropdown = ChoiceDropdown(
+            screen, self.avg_monitor, monitor_choices
         )
         row(screen, 0, "Default display / region", self.avg_monitor_dropdown)
         self.duration_scale = Scale(
@@ -538,10 +563,13 @@ class SettingsDisplay(Dialog):
             next(iter(self.audio_choices), "None"),
         )
         self.audio_source = StringVar(master, value=initial)
-        self.as_dropdown = OptionMenu(
-            presets, self.audio_source, *(self.audio_choices.keys() or ["None"])
+        self.as_dropdown = ChoiceDropdown(
+            presets,
+            self.audio_source,
+            self.audio_choices.keys(),
+            placeholder="No audio inputs available",
+            width=28,
         )
-        self.as_dropdown.configure(width=32, anchor="w")
         row(presets, 2, "Audio input", self.as_dropdown)
 
         shortcuts = self.pages["Shortcuts"]
@@ -550,10 +578,11 @@ class SettingsDisplay(Dialog):
         self.keybind_bulb_selection = StringVar(
             master, value=light_names[0] if light_names else "No lights found"
         )
-        self.keybind_bulb_dropdown = OptionMenu(
+        self.keybind_bulb_dropdown = ChoiceDropdown(
             shortcuts,
             self.keybind_bulb_selection,
-            *(light_names or ["No lights found"]),
+            light_names,
+            placeholder="No lights found",
         )
         self.keybind_bulb_dropdown.grid(
             row=0, column=0, sticky="ew", padx=(0, 6), pady=4
@@ -564,17 +593,23 @@ class SettingsDisplay(Dialog):
         self.keybind_keys_select.bind("<FocusIn>", self.on_keybind_keys_click)
         self.keybind_keys_select.bind("<FocusOut>", self.on_keybind_keys_focus_out)
         self.keybind_keys_select.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=4)
-        self.keybind_color_selection = StringVar(master, value="Color")
+        self.keybind_color_selection = StringVar(master, value="Action / colour")
         first_frame = next(iter(self.root_window.frame_map.values()), None)
         self._default_colors = (
             first_frame.default_colors if first_frame else {"RED": RED, "WHITE": WHITE}
         )
-        self.keybind_color_dropdown = OptionMenu(
+        self.keybind_color_dropdown = ChoiceDropdown(
             shortcuts,
             self.keybind_color_selection,
-            *KEYBIND_ACTIONS,
-            *self._default_colors,
-            *(config["PresetColors"].keys() or [None]),
+            {
+                **{name: name for name in KEYBIND_ACTIONS},
+                **{
+                    name: name.replace("_", " ").capitalize()
+                    for name in self._default_colors
+                },
+                **{name: name for name in config["PresetColors"]},
+            },
+            placeholder="Action / colour",
         )
         self.keybind_color_dropdown.grid(
             row=1, column=0, sticky="ew", padx=(0, 6), pady=4
@@ -715,7 +750,15 @@ class SettingsDisplay(Dialog):
         options = ["full", "get_primary_monitor"]
         try:
             with mss.mss() as sct:
-                options.extend([tuple(m.values()) for m in sct.monitors])
+                options.extend(
+                    (
+                        monitor["left"],
+                        monitor["top"],
+                        monitor["width"],
+                        monitor["height"],
+                    )
+                    for monitor in sct.monitors
+                )
         except Exception as exc:  # pylint: disable=broad-except
             self.logger.warning("Unable to enumerate display options: %s", exc)
         try:
@@ -732,13 +775,16 @@ class SettingsDisplay(Dialog):
         except queue.Empty:
             self._monitor_poll_after_id = self.after(40, self._poll_monitor_options)
             return
-        self.avg_monitor_dropdown["menu"].delete(0, END)
-        for option in options:
-            option_value = str(option)
-            self.avg_monitor_dropdown["menu"].add_command(
-                label=option_value,
-                command=lambda value=option_value: self.avg_monitor.set(value),
-            )
+        labels = {"full": "All displays", "get_primary_monitor": "Primary display"}
+        for index, option in enumerate(options[2:]):
+            left, top, width, height = option
+            name = "Combined desktop" if index == 0 else f"Display {index}"
+            labels[str(option)] = f"{name} · {width} × {height} ({left}, {top})"
+        # Keep a saved custom capture region selectable after enumeration.
+        current = self.avg_monitor.get()
+        if current not in labels:
+            labels[current] = f"Custom region · {current}"
+        self.avg_monitor_dropdown.set_choices(labels)
 
     def get_color(self):
         """Present user with color palette dialog and return color in HSBK"""
